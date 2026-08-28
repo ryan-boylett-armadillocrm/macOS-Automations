@@ -357,13 +357,15 @@ def convert_movie(path):
     return produced
 
 
-def build_page(name, palette, preview):
+def build_page(name, palette, preview, total = 1, current = 0):
     """
     Renders the picker GUI as a single self-contained page
 
     @param name - Filename shown in the header
     @param palette - Sampled colours with their pixel share
-    @param preview - Base64 PNG of the unmodified first frame
+    @param preview - Base64 PNG of the unmodified preview frame
+    @param total - Frame count of the source animation
+    @param current - Frame the preview was taken from
     """
 
     return f"""<!doctype html>
@@ -681,6 +683,13 @@ def build_page(name, palette, preview):
         <div class="picker__swatches" id="swatches"></div>
 
         <div class="picker__label">
+          <span>Preview frame</span>
+          <span id="frame-value">{ current } / { max(total - 1, 0) }</span>
+        </div>
+
+        <input class="picker__slider" id="frame" type="range" min="0" max="{ max(total - 1, 0) }" value="{ current }" />
+
+        <div class="picker__label">
           <span>Grouping threshold</span>
           <span id="threshold-value">{ DEFAULT_THRESHOLD }</span>
         </div>
@@ -750,6 +759,8 @@ def build_page(name, palette, preview):
       const disposalSelect = document.getElementById('disposal');
       const modeSelect = document.getElementById('mode');
       const targetInput = document.getElementById('target');
+      const frameSlider = document.getElementById('frame');
+      const frameValue = document.getElementById('frame-value');
       const animateButton = document.getElementById('animate');
       const playButton = document.getElementById('play');
       const rewindButton = document.getElementById('rewind');
@@ -920,7 +931,8 @@ def build_page(name, palette, preview):
           tolerance: Number(toleranceSlider.value),
           disposal: disposalSelect.value,
           mode: modeSelect.value,
-          target: targetInput.value
+          target: targetInput.value,
+          frame: Number(frameSlider.value)
         }};
       }}
 
@@ -932,13 +944,7 @@ def build_page(name, palette, preview):
         canvas.hidden = true;
         preview.hidden = false;
 
-        if (selected.size === 0) {{
-          preview.src = basePreview;
-          status.textContent = '';
-
-          return;
-        }}
-
+        // Fetched even with nothing selected, so the frame slider still moves
         const response = await fetch('/preview', {{ method: 'POST', body: JSON.stringify(settings()) }});
 
         preview.src = URL.createObjectURL(await response.blob());
@@ -1144,6 +1150,12 @@ def build_page(name, palette, preview):
 
       targetInput.addEventListener('input', refresh);
 
+      frameSlider.addEventListener('input', () => {{
+        frameValue.textContent = `${{ frameSlider.value }} / ${{ frameSlider.max }}`;
+      }});
+
+      frameSlider.addEventListener('change', renderPreview);
+
       // Snapping almost always targets the background, which is the colour
       // covering the most pixels
       if (palette.length) {{
@@ -1169,7 +1181,7 @@ def serve(source, destination, palette, preview, frame = 0):
     @param frame - Index of the frame shown in the still preview
     """
 
-    page = build_page(source.name, palette, preview).encode()
+    page = build_page(source.name, palette, preview, frame_count(source), frame).encode()
     finished = threading.Event()
     outcome = {}
     heartbeat = { 'seen': None }
@@ -1247,7 +1259,9 @@ def serve(source, destination, palette, preview, frame = 0):
             target = payload.get('target', '#000000')
 
             if self.path == '/preview':
-                self.respond(200, render_preview(source, colours, tolerance, frame, mode, target), 'image/png')
+                index = payload.get('frame', frame)
+
+                self.respond(200, render_preview(source, colours, tolerance, index, mode, target), 'image/png')
 
                 return
 
