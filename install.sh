@@ -179,11 +179,17 @@ done
 
 # 6. Adobe Photoshop check (Convert to GIF workflow)
 echo ""
-if ls -d /Applications/Adobe\ Photoshop\ *.app &>/dev/null 2>&1; then
-  PS_APP=$(ls -d /Applications/Adobe\ Photoshop\ *.app 2>/dev/null | sort -r | head -1)
-  echo "  ✓ Photoshop → $PS_APP"
+
+# Adobe nests the bundle inside a versioned folder, so the app is one level
+# down - this is the same pattern the Convert to GIF workflow globs for
+PS_APPS=(/Applications/Adobe\ Photoshop\ */Adobe\ Photoshop\ *.app)
+
+if [[ ${#PS_APPS[@]} -gt 0 ]]; then
+  # Globs expand in ascending order, so the newest version sorts last
+  echo "  ✓ Photoshop -> ${PS_APPS[${#PS_APPS[@]} - 1]}"
+
 else
-  warn "Adobe Photoshop not found — the 'Convert to GIF' workflow requires it."
+  warn "Adobe Photoshop not found - the 'Convert to GIF' workflow requires it"
   warn "Install via Creative Cloud: https://creativecloud.adobe.com"
 fi
 
