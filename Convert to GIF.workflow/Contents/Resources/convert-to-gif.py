@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 
 """
-Dial in Photoshop's movie to GIF conversion through a local browser UI
+Convert movies to GIF through gifski, driven from a local browser UI
 
-Pulls one representative frame out of the movie, round-trips it through
-Photoshop's Save for Web encoder at the current settings, and shows it
-against the untouched source so quantisation artefacts can be judged
-before committing to a full render
+gifski assigns every frame its own colour table, so gradients and glows
+survive instead of collapsing into the stray pixels a single shared
+palette produces. Its command line also decodes with ffmpeg, which
+resolves ambiguous ProRes colour tags the same way Photoshop does, unlike
+the Gifski app's AVFoundation path
 
-Once the settings look right the whole movie goes through mov-to-gif.sh
-with those exact values
+The UI mirrors the Gifski app: trim, dimensions, speed, frame rate,
+quality, loops and bounce, over a scrubbable preview
 
 The script must live outside ~/Library/CloudStorage: macOS denies
 Finder-invoked services read access to OneDrive's FileProvider domain
@@ -31,22 +32,14 @@ from argparse import ArgumentParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-PREVIEW_WIDTH = 650
-PREVIEW_SAMPLE_FRAMES = 24
-DEFAULT_COLOURS = 256
-DEFAULT_DITHER = 100
-DEFAULT_REDUCTION = 'adaptive'
-DEFAULT_WIDTH = 650
-REDUCTIONS = ( 'selective', 'perceptual', 'adaptive', 'web' )
+PREVIEW_WIDTH = 420
+PREVIEW_FRAME_CAP = 240
+ESTIMATE_FRAMES = 12
+DEFAULT_FPS = 30
+DEFAULT_QUALITY = 90
 HEARTBEAT_INTERVAL = 2
 HEARTBEAT_GRACE = 8
 STARTUP_GRACE = 45
-
-CONVERTER_CANDIDATES = (
-    Path(__file__).resolve().parent / 'mov-to-gif.sh',
-    Path.home() / 'Library/Services/Remove Colours.workflow/Contents/Resources/mov-to-gif.sh',
-    Path.home() / 'Library/CloudStorage/OneDrive-BondBrandLoyalty,Inc/Scripts/mov-to-gif.sh',
-)
 
 
 def notify(title, message):
@@ -78,294 +71,226 @@ def require_binary(name):
     return found
 
 
-def find_converter():
+def run(command, failure):
     """
-    Locates a readable copy of mov-to-gif.sh
+    Runs a command and raises with its stderr when it fails
 
-    Readability matters more than existence, because macOS denies
-    Finder-invoked services access to CloudStorage even when the file is there
-    """
+    Bare CalledProcessError only carries an exit code, which says nothing
+    about what actually went wrong inside ffmpeg or gifski
 
-    for candidate in CONVERTER_CANDIDATES:
-        try:
-            candidate.open('rb').close()
-
-            return candidate
-
-        except OSError:
-            continue
-
-    locations = ' or '.join(str(candidate) for candidate in CONVERTER_CANDIDATES)
-
-    raise RuntimeError(f'mov-to-gif.sh is not readable at { locations }')
-
-
-def photoshop_name():
-    """
-    Returns the newest installed Photoshop's application name
+    @param command - Argument list to execute
+    @param failure - Prefix for the error message
     """
 
-    apps = sorted(Path('/Applications').glob('Adobe Photoshop */Adobe Photoshop *.app'), reverse = True)
+    result = subprocess.run(command, capture_output = True, text = True)
 
-    if not apps:
-        raise RuntimeError('Adobe Photoshop not found in /Applications')
+    if result.returncode != 0:
+        detail = ( result.stderr or '' ).strip().splitlines()
 
-    return apps[ 0 ].stem
+        raise RuntimeError(f'{ failure }: { detail[ -1 ] if detail else f"exit { result.returncode }" }')
+
+    return result
 
 
-def movie_frames(path):
+def movie_info(path):
     """
-    Counts the frames in a movie so a representative one can be chosen
+    Reads the frame count, rate and dimensions of a movie
 
     @param path - Movie to inspect
     """
 
     result = subprocess.run(
-        [ require_binary('ffprobe'), '-v', 'error', '-select_streams', 'v:0',
-          '-count_frames', '-show_entries', 'stream=nb_read_frames', '-of', 'csv=p=0', str(path) ],
+        [ require_binary('ffprobe'), '-v', 'error', '-select_streams', 'v:0', '-count_frames',
+          '-show_entries', 'stream=nb_read_frames,r_frame_rate,width,height',
+          '-of', 'default=nw=1', str(path) ],
         capture_output = True, text = True
     )
 
-    match = re.search(r'\d+', result.stdout)
+    fields = dict(
+        line.split('=', 1) for line in result.stdout.splitlines() if '=' in line
+    )
 
-    return int(match.group()) if match else 1
+    rate = fields.get('r_frame_rate', '30/1')
+    numerator, _, denominator = rate.partition('/')
+    fps = float(numerator) / float(denominator or 1)
+    frames = int(fields.get('nb_read_frames', 0) or 0)
+
+    return {
+        'frames': max(frames, 1),
+        'fps': round(fps, 3),
+        'width': int(fields.get('width', 0) or 0),
+        'height': int(fields.get('height', 0) or 0),
+        'duration': round(max(frames, 1) / fps, 2) if fps else 0,
+    }
 
 
-def extract_frame(path, index, width, destination):
+def preview_frames(path, info, work):
     """
-    Pulls a single frame out of the movie as a PNG
+    Extracts every frame at preview size so scrubbing needs no round trip
 
-    Passing no width keeps the frame at its native size. That matters for
-    anything headed to Photoshop, because mov-to-gif.sh resizes inside
-    Photoshop with bicubic, and pre-scaling here with a different resampler
-    shifts the colours of fine detail enough to misrepresent the result
+    Long movies are strided down to a cap, which keeps the page payload
+    reasonable while still covering the whole timeline
 
     @param path - Movie to read
-    @param index - Frame number to extract
-    @param width - Width to scale to, or None to keep native size
-    @param destination - Path the PNG is written to
+    @param info - Result of movie_info
+    @param work - Directory the frames are written to
     """
 
-    scale = f',scale={ width }:-1' if width else ''
+    stride = max(1, info[ 'frames' ] // PREVIEW_FRAME_CAP)
+    selector = f"select='not(mod(n\\,{ stride }))'," if stride > 1 else ''
 
-    subprocess.run(
+    run(
         [ require_binary('ffmpeg'), '-v', 'error', '-i', str(path),
-          '-vf', f'select=eq(n\\,{ index }){ scale }', '-frames:v', '1', '-y', str(destination) ],
-        capture_output = True, check = True
+          # ffmpeg 8 removed -vsync; passthrough keeps selected frames as-is
+          '-vf', f'{ selector }scale={ PREVIEW_WIDTH }:-1', '-fps_mode', 'passthrough',
+          str(work / 'p_%05d.png') ],
+        'Could not extract preview frames'
     )
 
-    return destination
+    frames = sorted(work.glob('p_*.png'))
+
+    return [ base64.b64encode(frame.read_bytes()).decode() for frame in frames ], stride
 
 
-def photoshop_script(body):
+def trim_clip(source, destination, start, end, info):
     """
-    Runs an ExtendScript snippet in Photoshop and returns its stderr
+    Cuts the movie to the chosen range without re-encoding
 
-    @param body - ExtendScript source to execute
-    """
+    ProRes is all-intra, so a stream copy lands exactly on the requested
+    frames and costs nothing in quality or time
 
-    name = photoshop_name()
-
-    with tempfile.NamedTemporaryFile('w', suffix = '.jsx', delete = False) as handle:
-        handle.write(body)
-        script = handle.name
-
-    result = subprocess.run(
-        [ 'osascript', '-e', f'tell application "{ name }" to do javascript file "{ script }"' ],
-        capture_output = True, text = True
-    )
-
-    Path(script).unlink(missing_ok = True)
-
-    return result.stderr.strip()
-
-
-def photoshop_resize(source, destination, width):
-    """
-    Resizes a frame through Photoshop so the reference view matches the encode
-
-    Both views have to come off the same resampler, otherwise the comparison
-    shows ImageMagick's interpolation rather than what Photoshop will produce
-
-    @param source - PNG frame at native size
-    @param destination - PNG path to write
-    @param width - Target width in pixels
-    """
-
-    error = photoshop_script(f"""(function () {{
-  app.displayDialogs = DialogModes.NO;
-
-  var doc = app.open(new File("{ source }"));
-  var targetWidth = { width };
-  var targetHeight = Math.round(targetWidth * (doc.height.as("px") / doc.width.as("px")));
-
-  doc.resizeImage(UnitValue(targetWidth, "px"), UnitValue(targetHeight, "px"), doc.resolution, ResampleMethod.BICUBIC);
-
-  var options = new PNGSaveOptions();
-
-  doc.saveAs(new File("{ destination }"), options, true, Extension.LOWERCASE);
-  doc.close(SaveOptions.DONOTSAVECHANGES);
-}})();""")
-
-    if not Path(destination).exists():
-        raise RuntimeError(error or 'Photoshop could not resize the frame')
-
-    return destination
-
-
-def preview_indices(total, selected):
-    """
-    Picks frames spread across the movie, always including the chosen one
-
-    Save for Web builds one adaptive palette for the whole animation, so a
-    preview encoded from a single frame allocates its 256 slots completely
-    differently to the finished GIF. Sampling proportionally across the
-    length gives the quantiser a representative spread to work from
-
-    @param total - Frame count of the movie
-    @param selected - Frame the user is inspecting
-    """
-
-    step = max(1, total // PREVIEW_SAMPLE_FRAMES)
-    indices = set(range(0, total, step))
-
-    indices.add(min(selected, max(total - 1, 0)))
-    ordered = sorted(indices)
-
-    return ordered, ordered.index(min(selected, max(total - 1, 0)))
-
-
-def build_proxy(source, indices, destination):
-    """
-    Builds a short ProRes clip holding just the sampled frames
-
-    Kept as ProRes so the proxy feeds mov-to-gif.sh exactly as the original
-    movie would, which is what makes the preview palette representative
-
-    @param source - Movie to sample
-    @param indices - Frame numbers to keep
+    @param source - Movie to cut
     @param destination - Movie path to write
+    @param start - First frame to keep
+    @param end - Last frame to keep
+    @param info - Result of movie_info
     """
 
-    expression = '+'.join(f'eq(n\\,{ index })' for index in indices)
+    rate = info[ 'fps' ] or 30
 
-    subprocess.run(
-        [ require_binary('ffmpeg'), '-v', 'error', '-i', str(source),
-          '-vf', f"select='{ expression }',setpts=N/FRAME_RATE/TB",
-          '-frames:v', str(len(indices)), '-c:v', 'prores_ks', '-y', str(destination) ],
-        capture_output = True, check = True
+    # Format specifiers cannot carry the usual padding inside the braces
+    begin = format(start / rate, '.4f')
+    stop = format(( end + 1 ) / rate, '.4f')
+
+    run(
+        [ require_binary('ffmpeg'), '-v', 'error', '-ss', begin,
+          '-to', stop, '-i', str(source), '-c', 'copy', '-y', str(destination) ],
+        'Could not trim the clip'
     )
 
     return destination
 
 
-def photoshop_encode(source, destination, settings):
+def gifski_command(source, destination, settings):
     """
-    Round-trips one frame through Photoshop's Save for Web GIF encoder
+    Builds the gifski invocation for the current settings
 
-    This is the same encoder the full conversion uses, so what the preview
-    shows is what the finished GIF will contain. ImageMagick's quantiser
-    would be faster but would not match Photoshop's output
-
-    @param source - PNG frame to encode
+    @param source - Movie to encode
     @param destination - GIF path to write
-    @param settings - Colour, dither and reduction values from the UI
-    """
-
-    name = photoshop_name()
-    reduction = settings.get('reduction', DEFAULT_REDUCTION)
-    transparency = 'true' if settings.get('transparency') else 'false'
-
-    with tempfile.NamedTemporaryFile('w', suffix = '.jsx', delete = False) as handle:
-        handle.write(f"""(function () {{
-  app.displayDialogs = DialogModes.NO;
-
-  var doc = app.open(new File("{ source }"));
-
-  // Resize here rather than upstream so the preview goes through the same
-  // bicubic step mov-to-gif.sh uses on the real render
-  var targetWidth = { settings.get('width', DEFAULT_WIDTH) };
-  var targetHeight = Math.round(targetWidth * (doc.height.as("px") / doc.width.as("px")));
-
-  doc.resizeImage(UnitValue(targetWidth, "px"), UnitValue(targetHeight, "px"), doc.resolution, ResampleMethod.BICUBIC);
-
-  var opts = new ExportOptionsSaveForWeb();
-
-  opts.format = SaveDocumentType.COMPUSERVEGIF;
-  opts.colors = { settings.get('colours', DEFAULT_COLOURS) };
-  opts.dither = Dither.DIFFUSION;
-  opts.ditherAmount = { settings.get('dither', DEFAULT_DITHER) };
-  opts.transparency = { transparency };
-  opts.interlaced = false;
-
-  // ColorReduction was removed in Photoshop 2026, so guard against its absence
-  if (typeof ColorReduction !== 'undefined') {{
-    var map = {{
-      selective: ColorReduction.SELECTIVE,
-      perceptual: ColorReduction.PERCEPTUAL,
-      adaptive: ColorReduction.ADAPTIVE,
-      web: ColorReduction.WEB
-    }};
-
-    opts.colorReduction = map["{ reduction }"] || ColorReduction.SELECTIVE;
-  }}
-
-  doc.exportDocument(new File("{ destination }"), ExportType.SAVEFORWEB, opts);
-  doc.close(SaveOptions.DONOTSAVECHANGES);
-}})();""")
-        script = handle.name
-
-    result = subprocess.run(
-        [ 'osascript', '-e', f'tell application "{ name }" to do javascript file "{ script }"' ],
-        capture_output = True, text = True
-    )
-
-    Path(script).unlink(missing_ok = True)
-
-    if not Path(destination).exists():
-        raise RuntimeError(result.stderr.strip() or 'Photoshop produced no output')
-
-    return destination
-
-
-def convert_movie(path, settings):
-    """
-    Runs the full movie through mov-to-gif.sh at the chosen settings
-
-    @param path - Movie to convert
-    @param settings - Colour, dither, reduction and width values from the UI
+    @param settings - Values collected from the UI
     """
 
     command = [
-        'bash', str(find_converter()),
-        '-c', str(settings.get('colours', DEFAULT_COLOURS)),
-        '-d', str(settings.get('dither', DEFAULT_DITHER)),
-        '-r', settings.get('reduction', DEFAULT_REDUCTION),
-        '-w', str(settings.get('width', DEFAULT_WIDTH)),
+        require_binary('gifski'),
+        '--output', str(destination),
+        '--fps', str(settings.get('fps', DEFAULT_FPS)),
+        '--quality', str(settings.get('quality', DEFAULT_QUALITY)),
+        '--fast-forward', str(settings.get('speed', 1)),
+        '--repeat', str(settings.get('repeat', 0)),
     ]
 
-    if settings.get('transparency'):
-        command.append('-T')
+    if settings.get('width'):
+        command += [ '--width', str(settings[ 'width' ]) ]
 
-    command.append(str(path))
+    if settings.get('height'):
+        command += [ '--height', str(settings[ 'height' ]) ]
 
-    result = subprocess.run(command, capture_output = True, text = True)
-    produced = path.with_suffix('.gif')
+    if settings.get('bounce'):
+        command.append('--bounce')
 
-    if result.returncode != 0 or not produced.exists():
-        raise RuntimeError(result.stderr.strip() or 'Photoshop did not produce a GIF')
+    # Pinning a colour guarantees it survives quantisation exactly, which
+    # matters when a flat brand background has to stay on value
+    if settings.get('fixed'):
+        command += [ '--fixed-color', settings[ 'fixed' ].lstrip('#') ]
 
-    return produced
+    if settings.get('fast'):
+        command.append('--fast')
+
+    command.append(str(source))
+
+    return command
 
 
-def build_page(name, source, total = 1, current = 0):
+def encode(source, destination, settings, info, work):
     """
-    Renders the settings UI as a single self-contained page
+    Runs the full gifski encode, trimming first when a range is set
+
+    @param source - Movie to convert
+    @param destination - GIF path to write
+    @param settings - Values collected from the UI
+    @param info - Result of movie_info
+    @param work - Directory for intermediates
+    """
+
+    clip = source
+    start = int(settings.get('start', 0))
+    end = int(settings.get('end', info[ 'frames' ] - 1))
+
+    if start > 0 or end < info[ 'frames' ] - 1:
+        clip = trim_clip(source, work / f'clip{ source.suffix }', start, end, info)
+
+    result = subprocess.run(gifski_command(clip, destination, settings), capture_output = True, text = True)
+
+    if result.returncode != 0 or not Path(destination).exists():
+        raise RuntimeError(result.stderr.strip().splitlines()[ -1 ] if result.stderr.strip() else 'gifski failed')
+
+    return destination
+
+
+def estimate_size(source, settings, info, work):
+    """
+    Encodes a short sample and scales it up for a rough size figure
+
+    @param source - Movie to sample
+    @param settings - Values collected from the UI
+    @param info - Result of movie_info
+    @param work - Directory for intermediates
+    """
+
+    start = int(settings.get('start', 0))
+    end = int(settings.get('end', info[ 'frames' ] - 1))
+    span = max(1, end - start + 1)
+    sample = min(ESTIMATE_FRAMES, span)
+
+    clip = trim_clip(source, work / f'sample{ source.suffix }', start, start + sample - 1, info)
+    target = work / 'sample.gif'
+
+    target.unlink(missing_ok = True)
+
+    probe = dict(settings)
+    probe[ 'bounce' ] = False
+
+    result = subprocess.run(gifski_command(clip, target, probe), capture_output = True, text = True)
+
+    if result.returncode != 0 or not target.exists():
+        return None
+
+    rate = settings.get('fps', DEFAULT_FPS) / (info[ 'fps' ] or 30) / max(settings.get('speed', 1), 0.01)
+    encoded = max(1, round(sample * rate))
+    total = max(1, round(span * rate))
+    scale = 2 if settings.get('bounce') else 1
+
+    return round(target.stat().st_size / encoded * total * scale)
+
+
+def build_page(name, info, frames, stride):
+    """
+    Renders the converter UI as a single self-contained page
 
     @param name - Filename shown in the header
-    @param source - Base64 PNG of the untouched reference frame
-    @param total - Frame count of the movie
-    @param current - Frame the reference image was taken from
+    @param info - Result of movie_info
+    @param frames - Base64 preview frames covering the timeline
+    @param stride - Source frames represented by each preview frame
     """
 
     return f"""<!doctype html>
@@ -388,135 +313,255 @@ def build_page(name, source, total = 1, current = 0):
       body {{
         display: flex;
         flex-direction: column;
-        gap: 14px;
+        gap: 12px;
         height: 100vh;
         margin: 0;
-        padding: 16px;
+        padding: 14px;
 
         font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
-        font-size: 13px;
+        font-size: 12px;
         color: var(--text);
 
         background: var(--bg);
       }}
 
-      .settings__header {{
+      .gif__header {{
         display: flex;
         align-items: baseline;
         gap: 8px;
       }}
 
-      .settings__title {{
+      .gif__title {{
         margin: 0;
 
-        font-size: 14px;
+        font-size: 13px;
         font-weight: 600;
       }}
 
-      .settings__filename {{
+      .gif__filename {{
         color: var(--muted);
       }}
 
-      .settings__body {{
-        display: grid;
-        grid-template-columns: 1fr 300px;
-        gap: 16px;
-        flex: 1;
-        min-height: 0;
-      }}
-
-      .settings__viewer {{
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-        min-width: 0;
-      }}
-
-      .settings__stage {{
+      .gif__stage {{
         display: flex;
         align-items: center;
         justify-content: center;
         flex: 1;
         min-height: 0;
-        overflow: auto;
-        padding: 12px;
+        padding: 10px;
 
         border: 1px solid var(--border);
         border-radius: 6px;
-        background: #2a2a2a;
+        background-color: #2a2a2a;
+        background-image:
+          linear-gradient(45deg, #333 25%, transparent 25%),
+          linear-gradient(-45deg, #333 25%, transparent 25%),
+          linear-gradient(45deg, transparent 75%, #333 75%),
+          linear-gradient(-45deg, transparent 75%, #333 75%);
+        background-size: 16px 16px;
+        background-position: 0 0, 0 8px, 8px -8px, -8px 0px;
       }}
 
-      .settings__image {{
-        image-rendering: pixelated;
+      .gif__preview {{
+        max-width: 100%;
+        max-height: 100%;
       }}
 
-      .settings__transport {{
+      .gif__transport {{
         display: flex;
         align-items: center;
         gap: 8px;
       }}
 
-      .settings__sidebar {{
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-        min-height: 0;
+      .gif__scrub {{
+        flex: 1;
+        min-width: 0;
+
+        accent-color: var(--accent);
       }}
 
-      .settings__label {{
-        display: flex;
-        justify-content: space-between;
+      .gif__time {{
+        flex: 0 0 auto;
 
-        font-size: 11px;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
+        font-variant-numeric: tabular-nums;
         color: var(--muted);
       }}
 
-      .settings__row {{
-        display: flex;
-        gap: 6px;
+      .gif__trim {{
+        position: relative;
+
+        height: 52px;
+        overflow: hidden;
+
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: #151515;
+        cursor: pointer;
+        touch-action: none;
       }}
 
-      .settings__select {{
-        width: 100%;
-        padding: 5px 8px;
+      .gif__strip {{
+        display: block;
 
-        font-family: inherit;
-        font-size: 12px;
-        color: var(--text);
+        width: 100%;
+        height: 100%;
+      }}
+
+      .gif__mask {{
+        position: absolute;
+        top: 0;
+        bottom: 0;
+
+        background: rgba(12, 12, 12, 0.72);
+        pointer-events: none;
+      }}
+
+      .gif__playhead {{
+        position: absolute;
+        top: 0;
+        bottom: 0;
+
+        width: 2px;
+        margin-left: -1px;
+
+        background: #ffffff;
+        box-shadow: 0 0 4px rgba(0, 0, 0, 0.8);
+        pointer-events: none;
+      }}
+
+      .gif__handle {{
+        position: absolute;
+        top: 0;
+        bottom: 0;
+
+        width: 10px;
+        margin-left: -5px;
+
+        border: 1px solid #7a5c00;
+        border-radius: 3px;
+        background: linear-gradient(#ffd351, #f0b400);
+        cursor: ew-resize;
+      }}
+
+      .gif__handle::after {{
+        position: absolute;
+        top: 50%;
+        left: 50%;
+
+        width: 2px;
+        height: 14px;
+        margin: -7px 0 0 -1px;
+
+        border-radius: 1px;
+        background: rgba(0, 0, 0, 0.45);
+
+        content: '';
+      }}
+
+      .gif__trimfields {{
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }}
+
+      .gif__input--frame {{
+        width: 62px;
+      }}
+
+      .gif__panels {{
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+      }}
+
+      .gif__panel {{
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px 12px;
 
         border: 1px solid var(--border);
         border-radius: 6px;
         background: var(--panel);
       }}
 
-      .settings__slider {{
-        width: 100%;
-
-        accent-color: var(--accent);
+      .gif__field {{
+        display: flex;
+        align-items: center;
+        gap: 8px;
       }}
 
-      .settings__scrub {{
+      .gif__key {{
+        flex: 0 0 74px;
+
+        text-align: right;
+        color: var(--muted);
+      }}
+
+      .gif__value {{
+        flex: 0 0 46px;
+
+        font-variant-numeric: tabular-nums;
+      }}
+
+      .gif__slider {{
         flex: 1;
         min-width: 0;
 
         accent-color: var(--accent);
       }}
 
-      .settings__frame {{
-        flex: 0 0 auto;
+      .gif__input {{
+        width: 74px;
+        padding: 4px 6px;
 
-        font-size: 11px;
-        font-variant-numeric: tabular-nums;
+        font-family: inherit;
+        font-size: 12px;
+        color: var(--text);
+
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        background: #1c1c1c;
+      }}
+
+      .gif__select {{
+        flex: 1;
+        min-width: 0;
+        padding: 4px 6px;
+
+        font-family: inherit;
+        font-size: 12px;
+        color: var(--text);
+
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        background: #1c1c1c;
+      }}
+
+      .gif__check {{
+        display: flex;
+        align-items: center;
+        gap: 6px;
+
+        accent-color: var(--accent);
+      }}
+
+      .gif__footer {{
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }}
+
+      .gif__status {{
+        flex: 1;
+
         color: var(--muted);
       }}
 
-      .settings__button {{
-        flex: 1;
-        padding: 7px 12px;
+      .gif__button {{
+        padding: 6px 16px;
 
-        font-size: 13px;
+        font-size: 12px;
         color: var(--text);
 
         border: 1px solid var(--border);
@@ -525,273 +570,467 @@ def build_page(name, source, total = 1, current = 0):
         cursor: pointer;
       }}
 
-      .settings__button--icon {{
-        flex: 0 0 auto;
-        min-width: 44px;
-        padding: 5px 10px;
-      }}
-
-      .settings__button--primary {{
+      .gif__button--primary {{
         color: #ffffff;
 
         border-color: transparent;
         background: var(--accent);
       }}
 
-      .settings__button--on {{
-        color: #ffffff;
-
-        border-color: var(--accent);
-      }}
-
-      .settings__button:disabled {{
+      .gif__button:disabled {{
         opacity: 0.4;
         cursor: default;
-      }}
-
-      .settings__spacer {{
-        flex: 1 1 0;
-        min-height: 8px;
-      }}
-
-      .settings__status {{
-        min-height: 15px;
-
-        font-size: 11px;
-        color: var(--muted);
       }}
     </style>
   </head>
 
   <body>
-    <div class="settings__header">
-      <h1 class="settings__title">Convert to GIF</h1>
-      <span class="settings__filename">{ name }</span>
+    <div class="gif__header">
+      <h1 class="gif__title">Convert to GIF</h1>
+      <span class="gif__filename">{ name }</span>
     </div>
 
-    <div class="settings__body">
-      <div class="settings__viewer">
-        <div class="settings__stage">
-          <img class="settings__image" id="image" src="data:image/png;base64,{ source }" alt="Preview" />
+    <div class="gif__stage">
+      <img class="gif__preview" id="preview" alt="Preview" />
+    </div>
+
+    <div class="gif__transport">
+      <button class="gif__button" id="play" type="button">Play</button>
+      <input class="gif__scrub" id="scrub" type="range" min="0" max="{ max(len(frames) - 1, 0) }" value="0" />
+      <span class="gif__time" id="time">00:00.00</span>
+    </div>
+
+    <div class="gif__trim" id="trim">
+      <canvas class="gif__strip" id="strip"></canvas>
+      <div class="gif__mask" id="mask-before"></div>
+      <div class="gif__mask" id="mask-after"></div>
+      <div class="gif__playhead" id="playhead"></div>
+      <div class="gif__handle" id="handle-start"></div>
+      <div class="gif__handle" id="handle-end"></div>
+    </div>
+
+    <div class="gif__trimfields">
+      <span class="gif__key">In</span>
+      <input class="gif__input gif__input--frame" id="start" type="number" min="0" max="{ max(info[ 'frames' ] - 1, 0) }" value="0" />
+      <span class="gif__time" id="start-time">00:00.00</span>
+
+      <span class="gif__key">Out</span>
+      <input class="gif__input gif__input--frame" id="end" type="number" min="0" max="{ max(info[ 'frames' ] - 1, 0) }" value="{ max(info[ 'frames' ] - 1, 0) }" />
+      <span class="gif__time" id="end-time">00:00.00</span>
+
+      <span class="gif__status" id="range">full clip</span>
+      <button class="gif__button" id="trim-reset" type="button">Reset trim</button>
+    </div>
+
+    <div class="gif__panels">
+      <div class="gif__panel">
+        <div class="gif__field">
+          <span class="gif__key">Dimensions</span>
+          <select class="gif__select" id="preset">
+            <option value="100">{ info[ 'width' ] } x { info[ 'height' ] } (Original)</option>
+            <option value="75">75%</option>
+            <option value="50">50%</option>
+            <option value="25">25%</option>
+            <option value="custom">Custom</option>
+          </select>
         </div>
 
-        <div class="settings__transport">
-          <button class="settings__button settings__button--icon" id="toggle" type="button">Source</button>
-          <button class="settings__button settings__button--icon" id="zoom" type="button">100%</button>
-          <input class="settings__scrub" id="frame" type="range" min="0" max="{ max(total - 1, 0) }" value="{ current }" />
-          <span class="settings__frame" id="frame-value">{ current } / { max(total - 1, 0) }</span>
+        <div class="gif__field">
+          <span class="gif__key">Width</span>
+          <input class="gif__input" id="width" type="number" min="16" value="{ info[ 'width' ] }" />
+          <span class="gif__key">Height</span>
+          <input class="gif__input" id="height" type="number" min="16" value="{ info[ 'height' ] }" />
+        </div>
+
+        <div class="gif__field">
+          <span class="gif__key">Speed</span>
+          <input class="gif__slider" id="speed" type="range" min="0.25" max="4" step="0.25" value="1" />
+          <span class="gif__value" id="speed-value">1x</span>
+        </div>
+
+        <div class="gif__field">
+          <span class="gif__key">Pin colour</span>
+          <input class="gif__input" id="fixed" type="text" placeholder="#040633" />
         </div>
       </div>
 
-      <div class="settings__sidebar">
-        <div class="settings__label">
-          <span>Colours</span>
-          <span id="colours-value">{ DEFAULT_COLOURS }</span>
+      <div class="gif__panel">
+        <div class="gif__field">
+          <span class="gif__key">FPS</span>
+          <input class="gif__slider" id="fps" type="range" min="1" max="50" value="{ min(int(info[ 'fps' ]) or DEFAULT_FPS, 50) }" />
+          <span class="gif__value" id="fps-value">{ min(int(info[ 'fps' ]) or DEFAULT_FPS, 50) }</span>
         </div>
 
-        <input class="settings__slider" id="colours" type="range" min="2" max="256" step="2" value="{ DEFAULT_COLOURS }" />
-
-        <div class="settings__label">
-          <span>Dither</span>
-          <span id="dither-value">{ DEFAULT_DITHER }%</span>
+        <div class="gif__field">
+          <span class="gif__key">Quality</span>
+          <input class="gif__slider" id="quality" type="range" min="1" max="100" value="{ DEFAULT_QUALITY }" />
+          <span class="gif__value" id="quality-value">{ DEFAULT_QUALITY }</span>
         </div>
 
-        <input class="settings__slider" id="dither" type="range" min="0" max="100" value="{ DEFAULT_DITHER }" />
-
-        <div class="settings__label">
-          <span>Colour reduction</span>
+        <div class="gif__field">
+          <span class="gif__key">Loops</span>
+          <input class="gif__input" id="loops" type="number" min="1" value="1" disabled />
+          <label class="gif__check"><input id="forever" type="checkbox" checked /> Loop forever</label>
         </div>
 
-        <select class="settings__select" id="reduction">
-          <option value="adaptive">Adaptive</option>
-          <option value="selective">Selective</option>
-          <option value="perceptual">Perceptual</option>
-          <option value="web">Web</option>
-        </select>
-
-        <div class="settings__label">
-          <span>Output width</span>
-          <span id="width-value">{ DEFAULT_WIDTH }px</span>
+        <div class="gif__field">
+          <span class="gif__key"></span>
+          <label class="gif__check"><input id="bounce" type="checkbox" /> Bounce</label>
+          <label class="gif__check"><input id="fast" type="checkbox" /> Fast encode</label>
         </div>
-
-        <input class="settings__slider" id="width" type="range" min="120" max="1200" step="10" value="{ DEFAULT_WIDTH }" />
-
-        <div class="settings__spacer"></div>
-
-        <div class="settings__row">
-          <button class="settings__button" id="reset" type="button">Reset</button>
-          <button class="settings__button settings__button--primary" id="convert" type="button">Convert</button>
-        </div>
-
-        <div class="settings__status" id="status"></div>
       </div>
+    </div>
+
+    <div class="gif__footer">
+      <span class="gif__status" id="status">{ info[ 'frames' ] } frames at { info[ 'fps' ] }fps, { info[ 'duration' ] }s</span>
+      <button class="gif__button" id="estimate" type="button">Estimate size</button>
+      <button class="gif__button" id="cancel" type="button">Cancel</button>
+      <button class="gif__button gif__button--primary" id="convert" type="button">Convert</button>
     </div>
 
     <script>
-      const sourceImage = 'data:image/png;base64,{ source }';
+      const frames = { json.dumps(frames) };
+      const stride = { stride };
+      const sourceFps = { info[ 'fps' ] or DEFAULT_FPS };
+      const sourceFrames = { info[ 'frames' ] };
+      const sourceWidth = { info[ 'width' ] };
+      const sourceHeight = { info[ 'height' ] };
 
-      const image = document.getElementById('image');
-      const toggleButton = document.getElementById('toggle');
-      const zoomButton = document.getElementById('zoom');
-      const convertButton = document.getElementById('convert');
+      const preview = document.getElementById('preview');
+      const scrub = document.getElementById('scrub');
+      const timeLabel = document.getElementById('time');
+      const playButton = document.getElementById('play');
+      const startInput = document.getElementById('start');
+      const endInput = document.getElementById('end');
+      const startTime = document.getElementById('start-time');
+      const endTime = document.getElementById('end-time');
+      const rangeLabel = document.getElementById('range');
+      const trim = document.getElementById('trim');
+      const strip = document.getElementById('strip');
+      const stripContext = strip.getContext('2d');
+      const maskBefore = document.getElementById('mask-before');
+      const maskAfter = document.getElementById('mask-after');
+      const playhead = document.getElementById('playhead');
+      const handleStart = document.getElementById('handle-start');
+      const handleEnd = document.getElementById('handle-end');
+
+      const thumbs = [];
+
+      let trimStart = 0;
+      let trimEnd = sourceFrames - 1;
+      let dragging = null;
+      const preset = document.getElementById('preset');
+      const widthInput = document.getElementById('width');
+      const heightInput = document.getElementById('height');
+      const loopsInput = document.getElementById('loops');
+      const foreverBox = document.getElementById('forever');
       const status = document.getElementById('status');
-      const frameSlider = document.getElementById('frame');
-      const frameValue = document.getElementById('frame-value');
+      const convertButton = document.getElementById('convert');
+      const estimateButton = document.getElementById('estimate');
 
-      const controls = [
-        [ 'colours', 'colours-value', value => value ],
-        [ 'dither', 'dither-value', value => `${{ value }}%` ],
-        [ 'width', 'width-value', value => `${{ value }}px` ]
+      const sliders = [
+        [ 'speed', value => `${{ value }}x` ],
+        [ 'fps', value => value ],
+        [ 'quality', value => value ]
       ];
 
-      let rendered = null;
-      let viewing = 'source';
-      let zoom = 1;
-      let busy = false;
-      let queued = false;
-      let sequence = 0;
+      let playing = false;
+      let timer = null;
+      let closing = false;
 
       /**
-       * Returns the current settings as sent to the server
+       * Formats a source frame index as mm:ss.hh
+       *
+       * @param index - Frame number in the source movie
+       */
+      function stamp(index) {{
+        const seconds = index / sourceFps;
+        const minutes = Math.floor(seconds / 60);
+        const rest = seconds - minutes * 60;
+
+        return `${{ String(minutes).padStart(2, '0') }}:${{ rest.toFixed(2).padStart(5, '0') }}`;
+      }}
+
+      /**
+       * Shows the preview frame at the current scrub position
+       */
+      function draw() {{
+        const index = Number(scrub.value);
+
+        preview.src = `data:image/png;base64,${{ frames[ index ] }}`;
+        timeLabel.textContent = stamp(index * stride);
+        playhead.style.left = `${{ frameToX(index * stride) }}px`;
+      }}
+
+      /**
+       * Steps playback forward, wrapping inside the trimmed range
+       */
+      function step() {{
+        const first = Math.floor(trimStart / stride);
+        const last = Math.floor(trimEnd / stride);
+        let next = Number(scrub.value) + 1;
+
+        if (next > last || next >= frames.length) {{
+          next = first;
+        }}
+
+        scrub.value = String(next);
+        draw();
+      }}
+
+      /**
+       * Collects the current settings for the server
        */
       function settings() {{
         return {{
-          colours: Number(document.getElementById('colours').value),
-          dither: Number(document.getElementById('dither').value),
-          reduction: document.getElementById('reduction').value,
-          width: Number(document.getElementById('width').value),
-          frame: Number(frameSlider.value)
+          start: trimStart,
+          end: trimEnd,
+          fps: Number(document.getElementById('fps').value),
+          quality: Number(document.getElementById('quality').value),
+          speed: Number(document.getElementById('speed').value),
+          width: Number(widthInput.value) || null,
+          height: Number(heightInput.value) || null,
+          repeat: foreverBox.checked ? 0 : Math.max(Number(loopsInput.value) || 1, 1),
+          bounce: document.getElementById('bounce').checked,
+          fast: document.getElementById('fast').checked,
+          fixed: document.getElementById('fixed').value.trim()
         }};
       }}
 
-      /**
-       * Shows either the untouched source frame or the encoded result
-       *
-       * @param which - Either source or rendered
-       */
-      function show(which) {{
-        viewing = which;
-        image.src = which === 'rendered' && rendered ? rendered : sourceImage;
-        toggleButton.textContent = which === 'rendered' ? 'Encoded' : 'Source';
-        toggleButton.classList.toggle('settings__button--on', which === 'rendered');
-      }}
-
-      /**
-       * Asks Photoshop to encode the current frame at the current settings
-       */
-      async function render() {{
-        // Requests coalesce rather than drop: a change made while Photoshop
-        // is busy re-runs afterwards, so the final settings always win
-        if (busy) {{
-          queued = true;
-
-          return;
-        }}
-
-        busy = true;
-        status.textContent = 'Encoding in Photoshop';
-
-        const ticket = ++sequence;
-
-        try {{
-          const response = await fetch('/preview', {{ method: 'POST', body: JSON.stringify(settings()) }});
-          const result = await response.json();
-
-          if (ticket !== sequence) {{
-            return;
-          }}
-
-          if (!result.ok) {{
-            status.textContent = result.message;
-
-            return;
-          }}
-
-          rendered = `data:image/png;base64,${{ result.image }}`;
-          status.textContent = result.colours;
-          show('rendered');
-        }}
-
-        finally {{
-          busy = false;
-
-          if (queued) {{
-            queued = false;
-            render();
-          }}
-        }}
-      }}
-
-      /**
-       * Pulls the selected frame again and shows it as the reference view
-       */
-      async function restage() {{
-        status.textContent = 'Extracting frame';
-
-        const ticket = ++sequence;
-        const response = await fetch('/frame', {{ method: 'POST', body: JSON.stringify(settings()) }});
-        const result = await response.json();
-
-        if (ticket !== sequence) {{
-          return;
-        }}
-
-        status.textContent = result.ok ? '' : result.message;
-
-        if (result.ok) {{
-          image.src = `data:image/png;base64,${{ result.image }}`;
-          rendered = null;
-          show('source');
-        }}
-      }}
-
-      controls.forEach(([ id, output, format ]) => {{
+      sliders.forEach(([ id, format ]) => {{
         const input = document.getElementById(id);
-        const label = document.getElementById(output);
+        const label = document.getElementById(`${{ id }}-value`);
 
         input.addEventListener('input', () => {{ label.textContent = format(input.value); }});
+      }});
 
-        // Width changes the reference view too, since Photoshop resizes both
-        input.addEventListener('change', async () => {{
-          if (id === 'width') {{
-            await restage();
+      scrub.addEventListener('input', () => {{
+        if (playing) {{
+          clearInterval(timer);
+          playing = false;
+          playButton.textContent = 'Play';
+        }}
+
+        draw();
+      }});
+
+      playButton.addEventListener('click', () => {{
+        playing = !playing;
+        playButton.textContent = playing ? 'Pause' : 'Play';
+
+        clearInterval(timer);
+
+        if (playing) {{
+          timer = setInterval(step, 1_000 / (sourceFps / stride));
+        }}
+      }});
+
+      /**
+       * Maps a source frame to its horizontal position on the strip
+       *
+       * @param frame - Frame number in the source movie
+       */
+      function frameToX(frame) {{
+        return sourceFrames < 2 ? 0 : frame / (sourceFrames - 1) * trim.clientWidth;
+      }}
+
+      /**
+       * Maps a horizontal position on the strip back to a source frame
+       *
+       * @param x - Offset in pixels from the strip's left edge
+       */
+      function xToFrame(x) {{
+        const span = trim.clientWidth || 1;
+
+        return Math.max(0, Math.min(sourceFrames - 1, Math.round(x / span * (sourceFrames - 1))));
+      }}
+
+      /**
+       * Shows the preview frame nearest a given source frame
+       *
+       * @param frame - Frame number in the source movie
+       */
+      function showSourceFrame(frame) {{
+        const index = Math.max(0, Math.min(frames.length - 1, Math.round(frame / stride)));
+
+        scrub.value = String(index);
+        draw();
+      }}
+
+      /**
+       * Paints thumbnails across the strip, centre-cropped so several fit
+       *
+       * A wide banner scaled to full aspect would be only a few pixels tall,
+       * so each thumbnail takes a centre slice instead
+       */
+      function drawStrip() {{
+        const width = trim.clientWidth;
+        const height = trim.clientHeight;
+        const ratio = window.devicePixelRatio || 1;
+
+        if (!width || !height) {{
+          return;
+        }}
+
+        strip.width = Math.round(width * ratio);
+        strip.height = Math.round(height * ratio);
+        stripContext.setTransform(ratio, 0, 0, ratio, 0, 0);
+        stripContext.clearRect(0, 0, width, height);
+
+        const slot = 58;
+        const count = Math.max(1, Math.round(width / slot));
+        const slotWidth = width / count;
+
+        for (let i = 0; i < count; i += 1) {{
+          const position = count === 1 ? 0 : i / (count - 1);
+          const image = thumbs[ Math.round(position * (thumbs.length - 1)) ];
+
+          if (!image || !image.complete || !image.naturalWidth) {{
+            continue;
           }}
 
-          render();
-        }});
+          const sliceWidth = Math.min(image.naturalWidth, image.naturalHeight * (slotWidth / height));
+          const sliceX = (image.naturalWidth - sliceWidth) / 2;
+
+          stripContext.drawImage(image, sliceX, 0, sliceWidth, image.naturalHeight, i * slotWidth, 0, slotWidth + 0.5, height);
+        }}
+      }}
+
+      /**
+       * Positions the masks, handles and playhead from the current state
+       */
+      function layout() {{
+        const left = frameToX(trimStart);
+        const right = frameToX(trimEnd);
+
+        maskBefore.style.left = '0px';
+        maskBefore.style.width = `${{ left }}px`;
+        maskAfter.style.left = `${{ right }}px`;
+        maskAfter.style.width = `${{ Math.max(0, trim.clientWidth - right) }}px`;
+        handleStart.style.left = `${{ left }}px`;
+        handleEnd.style.left = `${{ right }}px`;
+        playhead.style.left = `${{ frameToX(Number(scrub.value) * stride) }}px`;
+
+        startInput.value = String(trimStart);
+        endInput.value = String(trimEnd);
+        startTime.textContent = stamp(trimStart);
+        endTime.textContent = stamp(trimEnd);
+
+        const kept = trimEnd - trimStart + 1;
+
+        rangeLabel.textContent = trimStart === 0 && trimEnd === sourceFrames - 1
+          ? `full clip, ${{ sourceFrames }} frames`
+          : `${{ kept }} of ${{ sourceFrames }} frames, ${{ (kept / sourceFps).toFixed(2) }}s`;
+      }}
+
+      /**
+       * Applies a drag or click to whichever control is active
+       *
+       * @param what - One of start, end or scrub
+       * @param frame - Source frame the pointer is over
+       */
+      function applyDrag(what, frame) {{
+        if (what === 'start') {{
+          trimStart = Math.min(frame, trimEnd);
+          showSourceFrame(trimStart);
+        }}
+
+        else if (what === 'end') {{
+          trimEnd = Math.max(frame, trimStart);
+          showSourceFrame(trimEnd);
+        }}
+
+        else {{
+          showSourceFrame(frame);
+        }}
+
+        layout();
+      }}
+
+      trim.addEventListener('pointerdown', event => {{
+        const bounds = trim.getBoundingClientRect();
+        const x = event.clientX - bounds.left;
+        const toStart = Math.abs(x - frameToX(trimStart));
+        const toEnd = Math.abs(x - frameToX(trimEnd));
+
+        dragging = Math.min(toStart, toEnd) > 12 ? 'scrub' : (toStart <= toEnd ? 'start' : 'end');
+
+        trim.setPointerCapture(event.pointerId);
+        applyDrag(dragging, xToFrame(x));
       }});
 
-      document.getElementById('reduction').addEventListener('change', render);
+      trim.addEventListener('pointermove', event => {{
+        if (!dragging) {{
+          return;
+        }}
 
-      frameSlider.addEventListener('input', () => {{ frameValue.textContent = `${{ frameSlider.value }} / ${{ frameSlider.max }}`; }});
+        const bounds = trim.getBoundingClientRect();
 
-      frameSlider.addEventListener('change', async () => {{
-        await restage();
-        render();
+        applyDrag(dragging, xToFrame(event.clientX - bounds.left));
       }});
 
-      toggleButton.addEventListener('click', () => show(viewing === 'source' ? 'rendered' : 'source'));
+      [ 'pointerup', 'pointercancel' ].forEach(name => trim.addEventListener(name, () => {{ dragging = null; }}));
 
-      zoomButton.addEventListener('click', () => {{
-        zoom = zoom === 1 ? 2 : zoom === 2 ? 4 : 1;
-        zoomButton.textContent = `${{ zoom * 100 }}%`;
-        image.style.width = zoom === 1 ? 'auto' : `${{ image.naturalWidth * zoom }}px`;
+      [ startInput, endInput ].forEach(input => input.addEventListener('change', () => {{
+        const value = Math.max(0, Math.min(sourceFrames - 1, Number(input.value) || 0));
+
+        if (input === startInput) {{
+          trimStart = Math.min(value, trimEnd);
+          showSourceFrame(trimStart);
+        }}
+
+        else {{
+          trimEnd = Math.max(value, trimStart);
+          showSourceFrame(trimEnd);
+        }}
+
+        layout();
+      }}));
+
+      document.getElementById('trim-reset').addEventListener('click', () => {{
+        trimStart = 0;
+        trimEnd = sourceFrames - 1;
+        layout();
       }});
 
-      document.getElementById('reset').addEventListener('click', () => {{
-        document.getElementById('colours').value = {DEFAULT_COLOURS};
-        document.getElementById('dither').value = {DEFAULT_DITHER};
-        document.getElementById('width').value = {DEFAULT_WIDTH};
-        document.getElementById('reduction').value = '{DEFAULT_REDUCTION}';
-        document.getElementById('colours-value').textContent = '{DEFAULT_COLOURS}';
-        document.getElementById('dither-value').textContent = '{DEFAULT_DITHER}%';
-        document.getElementById('width-value').textContent = '{DEFAULT_WIDTH}px';
-        render();
+      window.addEventListener('resize', () => {{
+        drawStrip();
+        layout();
+      }});
+
+      preset.addEventListener('change', () => {{
+        if (preset.value === 'custom') {{
+          return;
+        }}
+
+        const factor = Number(preset.value) / 100;
+
+        widthInput.value = String(Math.round(sourceWidth * factor));
+        heightInput.value = String(Math.round(sourceHeight * factor));
+      }});
+
+      [ widthInput, heightInput ].forEach(input => input.addEventListener('input', () => {{
+        preset.value = 'custom';
+      }}));
+
+      foreverBox.addEventListener('change', () => {{
+        loopsInput.disabled = foreverBox.checked;
+      }});
+
+      estimateButton.addEventListener('click', async () => {{
+        estimateButton.disabled = true;
+        status.textContent = 'Encoding a sample';
+
+        const response = await fetch('/estimate', {{ method: 'POST', body: JSON.stringify(settings()) }});
+        const result = await response.json();
+
+        status.textContent = result.message;
+        estimateButton.disabled = false;
       }});
 
       convertButton.addEventListener('click', async () => {{
         convertButton.disabled = true;
-        status.textContent = 'Converting the whole movie, this takes a while';
+        status.textContent = 'Converting with gifski';
 
         const response = await fetch('/convert', {{ method: 'POST', body: JSON.stringify(settings()) }});
         const result = await response.json();
@@ -799,7 +1038,7 @@ def build_page(name, source, total = 1, current = 0):
         status.textContent = result.message;
 
         if (result.ok) {{
-          window.closing = true;
+          closing = true;
           setTimeout(() => window.close(), 1_500);
         }}
 
@@ -808,62 +1047,60 @@ def build_page(name, source, total = 1, current = 0):
         }}
       }});
 
+      document.getElementById('cancel').addEventListener('click', () => {{
+        closing = true;
+        navigator.sendBeacon('/cancel');
+        window.close();
+      }});
+
       setInterval(() => fetch('/ping', {{ method: 'POST' }}).catch(() => {{}}), { HEARTBEAT_INTERVAL * 1_000 });
 
       window.addEventListener('pagehide', () => {{
-        if (!window.closing) {{
+        if (!closing) {{
           navigator.sendBeacon('/cancel');
         }}
       }});
 
-      render();
+      // Thumbnails decode in the background; the strip repaints as they land
+      frames.forEach(data => {{
+        const image = new Image();
+
+        image.onload = drawStrip;
+        image.src = `data:image/png;base64,${{ data }}`;
+        thumbs.push(image);
+      }});
+
+      draw();
+      drawStrip();
+      layout();
     </script>
   </body>
 </html>"""
 
 
-def serve(source, work, total):
+def serve(source, info, work):
     """
-    Runs the settings UI and blocks until the user converts or closes it
+    Runs the converter UI and blocks until the user converts or closes it
 
     @param source - Movie being converted
-    @param work - Directory used for preview frames
-    @param total - Frame count of the movie
+    @param info - Result of movie_info
+    @param work - Directory for preview frames and intermediates
     """
 
-    middle = max(0, total // 2)
-
-    # Requests are served on parallel threads, but Photoshop is a single
-    # instance and the staged frames are shared files, so every step that
-    # touches either has to run one at a time
-    photoshop = threading.Lock()
-
-    def stage_frame(index, width = DEFAULT_WIDTH):
-        """
-        Extracts one frame at native size and returns a Photoshop-resized copy
-
-        @param index - Frame number to pull from the movie
-        @param width - Width the reference view is resized to
-        """
-
-        extract_frame(source, index, None, work / 'frame.png')
-
-        display = work / 'display.png'
-
-        display.unlink(missing_ok = True)
-        photoshop_resize(work / 'frame.png', display, width)
-
-        return display.read_bytes()
-
-    page = build_page(source.name, base64.b64encode(stage_frame(middle)).decode(), total, middle).encode()
+    frames, stride = preview_frames(source, info, work)
+    page = build_page(source.name, info, frames, stride).encode()
 
     finished = threading.Event()
     outcome = {}
     heartbeat = { 'seen': None }
 
+    # ffmpeg and gifski both saturate the machine, and the intermediates are
+    # shared files, so encodes run one at a time
+    encoder = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         """
-        Serves the settings page, frame previews and the final conversion
+        Serves the converter page, size estimates and the final encode
         """
 
         def log_message(self, *args):
@@ -899,7 +1136,7 @@ def serve(source, work, total):
 
         def do_GET(self):
             """
-            Serves the settings page
+            Serves the converter page
             """
 
             if self.path == '/':
@@ -911,7 +1148,7 @@ def serve(source, work, total):
 
         def do_POST(self):
             """
-            Handles heartbeats, frame changes, previews and the conversion
+            Handles heartbeats, size estimates and the conversion
             """
 
             if self.path == '/ping':
@@ -928,56 +1165,14 @@ def serve(source, work, total):
 
             payload = self.read_json()
 
-            if self.path == '/frame':
+            if self.path == '/estimate':
                 try:
-                    with photoshop:
-                        image = stage_frame(payload.get('frame', middle), payload.get('width', DEFAULT_WIDTH))
-
-                    body = { 'ok': True, 'image': base64.b64encode(image).decode() }
-
-                except (RuntimeError, subprocess.CalledProcessError) as error:
-                    body = { 'ok': False, 'message': str(error) }
-
-                self.respond(200, json.dumps(body).encode(), 'application/json')
-
-                return
-
-            if self.path == '/preview':
-                try:
-                    selected = payload.get('frame', middle)
-                    indices, position = preview_indices(total, selected)
-
-                    with photoshop:
-                        proxy = work / 'proxy.mov'
-                        produced = work / 'proxy.gif'
-
-                        proxy.unlink(missing_ok = True)
-                        produced.unlink(missing_ok = True)
-
-                        build_proxy(source, indices, proxy)
-                        convert_movie(proxy, payload)
-
-                        subprocess.run(
-                            [ require_binary('magick'), str(produced), '-coalesce',
-                              '-scene', '0', str(work / 'still_%04d.png') ],
-                            capture_output = True, check = True
-                        )
-
-                        frames = sorted(work.glob('still_*.png'))
-                        chosen = frames[ min(position, len(frames) - 1) ]
-                        data = chosen.read_bytes()
-                        palette = subprocess.run(
-                            [ require_binary('magick'), str(produced), '-coalesce', '-append', '-format', '%k', 'info:' ],
-                            capture_output = True, text = True
-                        ).stdout.strip()
-
-                        for stale in frames:
-                            stale.unlink(missing_ok = True)
+                    with encoder:
+                        size = estimate_size(source, payload, info, work)
 
                     body = {
-                        'ok': True,
-                        'image': base64.b64encode(data).decode(),
-                        'colours': f'{ palette or "?" } colours across { len(indices) } sampled frames'
+                        'ok': size is not None,
+                        'message': f'Estimated { size // 1_024 }KB' if size else 'Could not estimate'
                     }
 
                 except (RuntimeError, subprocess.CalledProcessError) as error:
@@ -988,10 +1183,14 @@ def serve(source, work, total):
                 return
 
             if self.path == '/convert':
+                destination = source.with_suffix('.gif')
+
                 try:
-                    produced = convert_movie(source, payload)
-                    size = produced.stat().st_size // 1_024
-                    outcome.update({ 'ok': True, 'message': f'Saved { produced.name } ({ size }KB)' })
+                    with encoder:
+                        encode(source, destination, payload, info, work)
+
+                    size = destination.stat().st_size // 1_024
+                    outcome.update({ 'ok': True, 'message': f'Saved { destination.name } ({ size }KB)' })
 
                 except (RuntimeError, subprocess.CalledProcessError) as error:
                     outcome.update({ 'ok': False, 'message': str(error) })
@@ -1034,9 +1233,9 @@ def serve(source, work, total):
 
                 continue
 
-            # A full conversion blocks the request thread well past the grace
+            # A long encode blocks its request thread well past the grace
             # period, so only idle sessions are timed out
-            if time.monotonic() - seen > HEARTBEAT_GRACE and not outcome:
+            if time.monotonic() - seen > HEARTBEAT_GRACE and not encoder.locked():
                 finished.set()
 
     url = f'http://127.0.0.1:{ port }/'
@@ -1048,14 +1247,14 @@ def serve(source, work, total):
         profile = Path.home() / 'Library/Caches/convert-to-gif-chrome'
 
         subprocess.Popen(
-            [ str(binary), f'--app={ url }', f'--user-data-dir={ profile }', '--window-size=1080,820', '--no-first-run', '--no-default-browser-check' ],
+            [ str(binary), f'--app={ url }', f'--user-data-dir={ profile }', '--window-size=820,880', '--no-first-run', '--no-default-browser-check' ],
             stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL
         )
 
     else:
         webbrowser.open(url)
 
-    print(f'Settings open at { url } - close the window to cancel', flush = True)
+    print(f'Converter open at { url } - close the window to cancel', flush = True)
 
     try:
         finished.wait()
@@ -1070,7 +1269,7 @@ def serve(source, work, total):
 
 def process(path):
     """
-    Opens the settings UI for one movie
+    Opens the converter UI for one movie
 
     @param path - Movie to convert
     """
@@ -1082,12 +1281,12 @@ def process(path):
 
         return
 
-    total = movie_frames(source)
+    info = movie_info(source)
 
-    print(f'Reading { source.name } ({ total } frames)')
+    print(f'Reading { source.name } ({ info[ "frames" ] } frames at { info[ "fps" ] }fps)')
 
     with tempfile.TemporaryDirectory() as work:
-        outcome = serve(source, Path(work), total)
+        outcome = serve(source, info, Path(work))
 
     if outcome:
         print(outcome[ 'message' ])
@@ -1098,10 +1297,10 @@ def process(path):
 
 def main():
     """
-    Parses arguments and opens the settings UI for each movie
+    Parses arguments and opens the converter for each movie
     """
 
-    parser = ArgumentParser(description = 'Dial in Photoshop movie to GIF conversion')
+    parser = ArgumentParser(description = 'Convert movies to GIF with gifski')
 
     parser.add_argument('files', nargs = '+', help = 'movie files to convert')
     parser.add_argument('--alert', action = 'store_true', help = 'report failures as a native alert rather than on stderr')
