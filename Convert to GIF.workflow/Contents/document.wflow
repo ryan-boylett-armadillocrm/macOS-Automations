@@ -60,161 +60,37 @@
 				<dict>
 					<key>COMMAND_STRING</key>
 					<string>#!/usr/bin/env bash
-# mov-to-gif.sh
-# Convert After Effects MOV files to animated GIFs via Photoshop Save for Web.
+# Convert to GIF - opens the settings UI so the Save for Web values can be
+# dialled in against a real encoded frame before the full render runs.
 #
-# Requirements:
-#   - Adobe Photoshop (any recent version in /Applications)
-#
-# Usage:
-#   mov-to-gif.sh [options] file.mov [file.mov …]
-#
-# Options:
-#   -c COLORS     Colour count 2–256                          (default: 128)
-#   -r REDUCTION  Color reduction: selective|perceptual|      (default: selective)
-#                   adaptive|web
-#   -d DITHER     Diffusion dither amount 0–100               (default: 88)
-#   -w WIDTH      Resize output to WIDTH px wide, height auto  (default: 650)
-#   -T            Enable transparency (off by default)
-#   -h            Show this help and exit
+# Detached so the Quick Action returns immediately: Finder kills services
+# that outlive their timeout, and the UI stays open as long as needed.
+# Photoshop is left running because the UI drives it for live previews.
 
-set -euo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
-OPT_COLORS=256
-OPT_REDUCTION="adaptive"
-OPT_DITHER=100
-OPT_WIDTH=650
-OPT_TRANSPARENCY=false
+SCRIPT="$HOME/Library/Services/Convert to GIF.workflow/Contents/Resources/convert-to-gif.py"
+LOG="$HOME/Library/Logs/convert-to-gif.log"
 
-# ── Usage ─────────────────────────────────────────────────────────────────────
-usage() {
-  grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '/^Usage/,/^$/p'
-  exit 0
-}
+mkdir -p "$(dirname "$LOG")"
 
-# ── Argument parsing ──────────────────────────────────────────────────────────
-while getopts ":c:r:d:w:Th" opt; do
-  case $opt in
-    c) OPT_COLORS="$OPTARG"      ;;
-    r) OPT_REDUCTION="$OPTARG"   ;;
-    d) OPT_DITHER="$OPTARG"      ;;
-    w) OPT_WIDTH="$OPTARG"       ;;
-    T) OPT_TRANSPARENCY=true     ;;
-    h) usage                     ;;
-    :) echo "Option -$OPTARG requires an argument." &gt;&amp;2; exit 1 ;;
-    ?) echo "Unknown option: -$OPTARG" &gt;&amp;2; exit 1             ;;
-  esac
-done
-shift $(( OPTIND - 1 ))
-
-if [[ $# -eq 0 ]]; then
-  echo "Error: no input files specified. Run with -h for help." &gt;&amp;2
+if ! head -c 1 "$SCRIPT" &gt;/dev/null 2&gt;&amp;1; then
+  osascript -e 'display alert "Convert to GIF" message "Cannot read convert-to-gif.py inside the workflow bundle."'
   exit 1
 fi
 
-# ── Find Photoshop ────────────────────────────────────────────────────────────
-PS_APP=$(ls -d /Applications/Adobe\ Photoshop\ */Adobe\ Photoshop\ *.app 2&gt;/dev/null | sort -r | head -1 || true)
-if [[ -z "$PS_APP" ]]; then
-  echo "Error: Adobe Photoshop not found in /Applications." &gt;&amp;2
-  exit 1
-fi
-PS_NAME=$(basename "$PS_APP" .app)
+{
+  echo "===== $(date) ====="
+  echo "ffmpeg=$(command -v ffmpeg) magick=$(command -v magick)"
+  echo "args=$*"
+} &gt;&gt; "$LOG" 2&gt;&amp;1
 
-# ── Temp directory (auto-cleaned on exit) ─────────────────────────────────────
-WORK_DIR=$(mktemp -d /tmp/mov-to-gif-XXXXXX)
-trap 'rm -rf "$WORK_DIR"' EXIT
-
-# ── Photoshop MOV → GIF export ────────────────────────────────────────────────
-ps_export() {
-  local input="$1" output="$2"
-  local transparency_val
-  local jsx_file="$WORK_DIR/export.jsx"
-
-  transparency_val="$( [[ $OPT_TRANSPARENCY == true ]] &amp;&amp; echo "true" || echo "false" )"
-
-  # Escape paths for use inside a JS double-quoted string
-  local js_input js_output
-  js_input="${input//\\/\\\\}"; js_input="${js_input//\"/\\\"}"
-  js_output="${output//\\/\\\\}"; js_output="${js_output//\"/\\\"}"
-
-  cat &gt; "$jsx_file" &lt;&lt;JSEOF
-(function () {
-  app.displayDialogs = DialogModes.NO;
-
-  var inputFile  = new File("${js_input}");
-  var outputFile = new File("${js_output}");
-
-  if (!inputFile.exists) {
-    throw new Error("Input file not found: " + inputFile.fsName);
-  }
-
-  var doc = app.open(inputFile);
-
-  var targetWidth  = ${OPT_WIDTH};
-  var originalWidth  = doc.width.as("px");
-  var originalHeight = doc.height.as("px");
-  var targetHeight = Math.round(targetWidth * (originalHeight / originalWidth));
-
-  doc.resizeImage(UnitValue(targetWidth, "px"), UnitValue(targetHeight, "px"), doc.resolution, ResampleMethod.BICUBIC);
-
-  var opts          = new ExportOptionsSaveForWeb();
-  opts.format       = SaveDocumentType.COMPUSERVEGIF;
-  opts.colors       = ${OPT_COLORS};
-  opts.dither       = Dither.DIFFUSION;
-  opts.ditherAmount = ${OPT_DITHER};
-  opts.transparency = ${transparency_val};
-  opts.interlaced   = false;
-
-  // ColorReduction enum was removed in Photoshop 2026; guard against its absence.
-  // When omitted, Photoshop defaults to Selective — which is what we want anyway.
-  if (typeof ColorReduction !== 'undefined') {
-    var reductionMap = {
-      selective:  ColorReduction.SELECTIVE,
-      perceptual: ColorReduction.PERCEPTUAL,
-      adaptive:   ColorReduction.ADAPTIVE,
-      web:        ColorReduction.WEB
-    };
-    opts.colorReduction = reductionMap["${OPT_REDUCTION}"] || ColorReduction.SELECTIVE;
-  }
-
-  doc.exportDocument(outputFile, ExportType.SAVEFORWEB, opts);
-  doc.close(SaveOptions.DONOTSAVECHANGES);
-})();
-JSEOF
-
-  osascript -e "tell application \"${PS_NAME}\" to do javascript file \"${jsx_file}\""
-}
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-echo "Photoshop: $PS_NAME"
-echo "Settings:  ${OPT_COLORS} colours · ${OPT_REDUCTION} reduction · ${OPT_DITHER}% dither · ${OPT_WIDTH}px wide · transparency=${OPT_TRANSPARENCY}"
-echo ""
-
-for input_arg in "$@"; do
-  input="$(cd "$(dirname "$input_arg")" &amp;&amp; pwd)/$(basename "$input_arg")"
-
-  if [[ ! -f "$input" ]]; then
-    echo "Warning: '${input_arg}' not found — skipping."
-    continue
-  fi
-
-  output="${input%.*}.gif"
-  echo "▶ $(basename "$input")"
-
-  ps_export "$input" "$output"
-
-  if [[ ! -f "$output" ]]; then
-    echo "  Error: Photoshop did not produce an output file." &gt;&amp;2
-    continue
-  fi
-
-  size=$(stat -f%z "$output")
-  echo "  Done: $(awk "BEGIN { printf \"%.0fKB\", ${size} / 1024 }") → $(basename "$output")"
-  echo ""
+for f in "$@"; do
+  nohup /usr/bin/python3 "$SCRIPT" --alert "$f" &gt;&gt; "$LOG" 2&gt;&amp;1 &amp;
+  disown $! 2&gt;/dev/null || true
 done
 
-echo "Done."
+exit 0
 </string>
 					<key>CheckedForUserDefaultShell</key>
 					<true/>
@@ -335,253 +211,9 @@ echo "Done."
 			<key>isViewVisible</key>
 			<integer>1</integer>
 		</dict>
-		<dict>
-			<key>action</key>
-			<dict>
-				<key>AMAccepts</key>
-				<dict>
-					<key>Container</key>
-					<string>List</string>
-					<key>Optional</key>
-					<true/>
-					<key>Types</key>
-					<array/>
-				</dict>
-				<key>AMActionVersion</key>
-				<string>2.0.2</string>
-				<key>AMApplication</key>
-				<array>
-					<string>Automator</string>
-				</array>
-				<key>AMParameterProperties</key>
-				<dict>
-					<key>pauseDuration</key>
-					<dict/>
-					<key>pauseUnit</key>
-					<dict/>
-				</dict>
-				<key>AMProvides</key>
-				<dict>
-					<key>Container</key>
-					<string>List</string>
-					<key>Types</key>
-					<array/>
-				</dict>
-				<key>ActionBundlePath</key>
-				<string>/System/Library/Automator/Pause.action</string>
-				<key>ActionName</key>
-				<string>Pause</string>
-				<key>ActionParameters</key>
-				<dict>
-					<key>pauseDuration</key>
-					<integer>5</integer>
-					<key>pauseUnit</key>
-					<integer>0</integer>
-				</dict>
-				<key>BundleIdentifier</key>
-				<string>com.apple.Automator.Pause</string>
-				<key>CFBundleVersion</key>
-				<string>2.0.2</string>
-				<key>CanShowSelectedItemsWhenRun</key>
-				<true/>
-				<key>CanShowWhenRun</key>
-				<false/>
-				<key>Category</key>
-				<array>
-					<string>AMCategoryUtilities</string>
-				</array>
-				<key>Class Name</key>
-				<string>PauseAction</string>
-				<key>InputUUID</key>
-				<string>79D97840-5D62-4C06-AB8B-A80F0B5C856E</string>
-				<key>Keywords</key>
-				<array>
-					<string>Time</string>
-					<string>Wait</string>
-				</array>
-				<key>OutputUUID</key>
-				<string>6B974D49-722A-4356-94B6-0EBA6278EA30</string>
-				<key>UUID</key>
-				<string>999126E0-CFE7-40B7-88F4-34D36321161C</string>
-				<key>UnlocalizedApplications</key>
-				<array>
-					<string>Automator</string>
-				</array>
-				<key>arguments</key>
-				<dict>
-					<key>0</key>
-					<dict>
-						<key>default value</key>
-						<integer>0</integer>
-						<key>name</key>
-						<string>pauseDuration</string>
-						<key>required</key>
-						<string>0</string>
-						<key>type</key>
-						<string>0</string>
-						<key>uuid</key>
-						<string>0</string>
-					</dict>
-					<key>1</key>
-					<dict>
-						<key>default value</key>
-						<integer>0</integer>
-						<key>name</key>
-						<string>pauseUnit</string>
-						<key>required</key>
-						<string>0</string>
-						<key>type</key>
-						<string>0</string>
-						<key>uuid</key>
-						<string>1</string>
-					</dict>
-				</dict>
-				<key>isViewVisible</key>
-				<integer>1</integer>
-				<key>location</key>
-				<string>641.000000:759.000000</string>
-				<key>nibPath</key>
-				<string>/System/Library/Automator/Pause.action/Contents/Resources/Base.lproj/main.nib</string>
-			</dict>
-			<key>isViewVisible</key>
-			<integer>1</integer>
-		</dict>
-		<dict>
-			<key>action</key>
-			<dict>
-				<key>AMAccepts</key>
-				<dict>
-					<key>Container</key>
-					<string>List</string>
-					<key>Optional</key>
-					<true/>
-					<key>Types</key>
-					<array/>
-				</dict>
-				<key>AMActionVersion</key>
-				<string>1.0.2</string>
-				<key>AMApplication</key>
-				<array>
-					<string>Finder</string>
-				</array>
-				<key>AMParameterProperties</key>
-				<dict>
-					<key>application</key>
-					<dict>
-						<key>isPathPopUp</key>
-						<true/>
-						<key>variableUUIDsInMenu</key>
-						<array/>
-					</dict>
-					<key>saveChanges</key>
-					<dict/>
-				</dict>
-				<key>AMProvides</key>
-				<dict>
-					<key>Container</key>
-					<string>List</string>
-					<key>Types</key>
-					<array/>
-				</dict>
-				<key>AMRequiredResources</key>
-				<array/>
-				<key>ActionBundlePath</key>
-				<string>/System/Library/Automator/Quit Application.action</string>
-				<key>ActionName</key>
-				<string>Quit Application</string>
-				<key>ActionParameters</key>
-				<dict>
-					<key>application</key>
-					<string>/Applications/Adobe Photoshop 2026/Adobe Photoshop 2026.app</string>
-					<key>saveChanges</key>
-					<false/>
-				</dict>
-				<key>BundleIdentifier</key>
-				<string>com.apple.Automator.QuitApplication</string>
-				<key>CFBundleVersion</key>
-				<string>1.0.2</string>
-				<key>CanShowSelectedItemsWhenRun</key>
-				<true/>
-				<key>CanShowWhenRun</key>
-				<true/>
-				<key>Category</key>
-				<array>
-					<string>AMCategoryUtilities</string>
-				</array>
-				<key>Class Name</key>
-				<string>AMQuitApplicationAction</string>
-				<key>InputUUID</key>
-				<string>8F11C7C3-F65B-47DE-8CF8-5CAD8C6D5518</string>
-				<key>Keywords</key>
-				<array>
-					<string>File</string>
-					<string>Quit</string>
-				</array>
-				<key>OutputUUID</key>
-				<string>A19CE5E9-30A7-459A-BC6E-129FA538EE9E</string>
-				<key>UUID</key>
-				<string>05A68504-8C31-47BC-90CA-3B1F2304A2A0</string>
-				<key>UnlocalizedApplications</key>
-				<array>
-					<string>Finder</string>
-				</array>
-				<key>arguments</key>
-				<dict>
-					<key>0</key>
-					<dict>
-						<key>default value</key>
-						<string>/System/Applications/Contacts.app</string>
-						<key>name</key>
-						<string>application</string>
-						<key>required</key>
-						<string>0</string>
-						<key>type</key>
-						<string>0</string>
-						<key>uuid</key>
-						<string>0</string>
-					</dict>
-					<key>1</key>
-					<dict>
-						<key>default value</key>
-						<true/>
-						<key>name</key>
-						<string>saveChanges</string>
-						<key>required</key>
-						<string>0</string>
-						<key>type</key>
-						<string>0</string>
-						<key>uuid</key>
-						<string>1</string>
-					</dict>
-				</dict>
-				<key>isViewVisible</key>
-				<integer>1</integer>
-				<key>location</key>
-				<string>641.000000:864.000000</string>
-				<key>nibPath</key>
-				<string>/System/Library/Automator/Quit Application.action/Contents/Resources/Base.lproj/main.nib</string>
-			</dict>
-			<key>isViewVisible</key>
-			<integer>1</integer>
-		</dict>
 	</array>
 	<key>connectors</key>
-	<dict>
-		<key>4EE59379-A6B4-413F-A5B7-6D5F9ECFD964</key>
-		<dict>
-			<key>from</key>
-			<string>999126E0-CFE7-40B7-88F4-34D36321161C - 999126E0-CFE7-40B7-88F4-34D36321161C</string>
-			<key>to</key>
-			<string>05A68504-8C31-47BC-90CA-3B1F2304A2A0 - 05A68504-8C31-47BC-90CA-3B1F2304A2A0</string>
-		</dict>
-		<key>5766EECA-A96A-41C6-8F4F-F2B20F83030A</key>
-		<dict>
-			<key>from</key>
-			<string>3B7AC2C5-407F-454C-9D54-4F8E57E4C4E0 - 3B7AC2C5-407F-454C-9D54-4F8E57E4C4E0</string>
-			<key>to</key>
-			<string>999126E0-CFE7-40B7-88F4-34D36321161C - 999126E0-CFE7-40B7-88F4-34D36321161C</string>
-		</dict>
-	</dict>
+	<dict/>
 	<key>workflowMetaData</key>
 	<dict>
 		<key>applicationBundleID</key>
