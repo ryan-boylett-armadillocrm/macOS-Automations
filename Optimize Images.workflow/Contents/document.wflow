@@ -1,0 +1,453 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AMApplicationBuild</key>
+	<string>534</string>
+	<key>AMApplicationVersion</key>
+	<string>2.10</string>
+	<key>AMDocumentVersion</key>
+	<string>2</string>
+	<key>actions</key>
+	<array>
+		<dict>
+			<key>action</key>
+			<dict>
+				<key>AMAccepts</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Optional</key>
+					<true/>
+					<key>Types</key>
+					<array>
+						<string>com.apple.cocoa.path</string>
+					</array>
+				</dict>
+				<key>AMActionVersion</key>
+				<string>2.1.1</string>
+				<key>AMApplication</key>
+				<array>
+					<string>Finder</string>
+				</array>
+				<key>AMParameterProperties</key>
+				<dict/>
+				<key>AMProvides</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Types</key>
+					<array>
+						<string>com.apple.cocoa.path</string>
+					</array>
+				</dict>
+				<key>AMRequiredResources</key>
+				<array/>
+				<key>ActionBundlePath</key>
+				<string>/System/Library/Automator/Get Selected Finder Items 2.action</string>
+				<key>ActionName</key>
+				<string>Get Selected Finder Items</string>
+				<key>ActionParameters</key>
+				<dict/>
+				<key>BundleIdentifier</key>
+				<string>com.apple.Automator.GetSelectedFinderItems2</string>
+				<key>CFBundleVersion</key>
+				<string>2.1.1</string>
+				<key>CanShowSelectedItemsWhenRun</key>
+				<false/>
+				<key>CanShowWhenRun</key>
+				<true/>
+				<key>Category</key>
+				<array>
+					<string>AMCategoryFilesAndFolders</string>
+				</array>
+				<key>Class Name</key>
+				<string>AMGetSelectedFinderItemsAction</string>
+				<key>InputUUID</key>
+				<string>BC7FCA20-0045-4488-B126-E7EE4D0C1231</string>
+				<key>Keywords</key>
+				<array/>
+				<key>OutputUUID</key>
+				<string>62013820-67C1-4458-A3A5-B1406ED609BF</string>
+				<key>UUID</key>
+				<string>F87B883D-EF9C-466C-838A-392692129DD7</string>
+				<key>UnlocalizedApplications</key>
+				<array>
+					<string>Finder</string>
+				</array>
+				<key>arguments</key>
+				<dict/>
+				<key>isViewVisible</key>
+				<integer>1</integer>
+				<key>location</key>
+				<string>207.000000:68.000000</string>
+			</dict>
+			<key>isViewVisible</key>
+			<integer>1</integer>
+		</dict>
+		<dict>
+			<key>action</key>
+			<dict>
+				<key>AMAccepts</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Optional</key>
+					<true/>
+					<key>Types</key>
+					<array>
+						<string>com.apple.cocoa.string</string>
+					</array>
+				</dict>
+				<key>AMActionVersion</key>
+				<string>2.0.3</string>
+				<key>AMApplication</key>
+				<array>
+					<string>Automator</string>
+				</array>
+				<key>AMParameterProperties</key>
+				<dict>
+					<key>COMMAND_STRING</key>
+					<dict/>
+					<key>CheckedForUserDefaultShell</key>
+					<dict/>
+					<key>inputMethod</key>
+					<dict/>
+					<key>shell</key>
+					<dict/>
+					<key>source</key>
+					<dict/>
+				</dict>
+				<key>AMProvides</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Types</key>
+					<array>
+						<string>com.apple.cocoa.string</string>
+					</array>
+				</dict>
+				<key>ActionBundlePath</key>
+				<string>/System/Library/Automator/Run Shell Script.action</string>
+				<key>ActionName</key>
+				<string>Run Shell Script</string>
+				<key>ActionParameters</key>
+				<dict>
+					<key>COMMAND_STRING</key>
+					<string>#!/usr/bin/env bash
+
+# ---- Configuration ----
+PNGQUANT_FLAGS="--quality=65-80 --speed=1"
+OPTIPNG_FLAGS="-o7"
+JPEGOPTIM_FLAGS="--strip-all --max=85"
+WEBP_LOSSY_QUALITY=85
+
+GIF_MAX_MB=2.5
+GIF_MAX_PASSES=3
+GIF_LOSSY_START=30
+GIF_LOSSY_MAX=80
+GIF_LOSSY_STEP=10
+
+# ---- GIF helpers ----
+_gif_file_bytes()  { stat -f%z "$1"; }
+_gif_max_bytes()   { awk "BEGIN { printf \"%d\", ${GIF_MAX_MB} * 1024 * 1024 }"; }
+_gif_under_limit() { [[ $(_gif_file_bytes "$1") -le $(_gif_max_bytes) ]]; }
+
+_gif_frame_count() {
+  /opt/homebrew/bin/gifsicle -I "$1" 2&gt;/dev/null | grep -c "image #" || true
+}
+
+_gif_delay_cs() {
+  local raw
+  raw=$(/opt/homebrew/bin/gifsicle -I "$1" 2&gt;/dev/null \
+    | grep -m1 "delay" \
+    | grep -oE '[0-9]+\.[0-9]+' \
+    || true)
+  [[ -n "$raw" ]] &amp;&amp; awk "BEGIN { printf \"%d\", ${raw} * 100 }" || echo "4"
+}
+
+_gif_halve_frames() {
+  local input="$1" output="$2"
+  local unopt frame_count delay_cs new_delay select_args=() i
+
+  unopt=$(mktemp /tmp/gif-unopt-XXXXXX)
+  /opt/homebrew/bin/gifsicle --unoptimize "$input" -o "$unopt" &gt;/dev/null 2&gt;&amp;1
+
+  frame_count=$(_gif_frame_count "$unopt")
+  if [[ "$frame_count" -le 2 ]]; then
+    mv "$unopt" "$output"
+    return
+  fi
+
+  delay_cs=$(_gif_delay_cs "$unopt")
+  [[ -z "$delay_cs" || "$delay_cs" -eq 0 ]] &amp;&amp; delay_cs=4
+  new_delay=$(( delay_cs * 2 ))
+
+  for (( i=0; i&lt;frame_count; i+=2 )); do
+    select_args+=( "#${i}" )
+  done
+
+  last=$(( frame_count - 1 ))
+  (( last % 2 != 0 )) &amp;&amp; select_args+=( "#${last}" )
+
+  /opt/homebrew/bin/gifsicle -O2 --delay "$new_delay" \
+    "$unopt" "${select_args[@]}" \
+    -o "$output" &gt;/dev/null 2&gt;&amp;1
+
+  rm -f "$unopt"
+}
+
+# ---- Per-file worker ----
+optimize_one() {
+    local FILE="$1"
+    [ -f "$FILE" ] || return
+
+    local filename base EXT EXT_LOWER
+
+    filename=$(basename "$FILE")
+    base="${filename%.*}"
+
+    # Skip files ending with _ol, _out, _outlook
+    #if [[ "$base" =~ (_ol|_out|_outlook)$ ]]; then
+    #    return
+    #fi
+
+    EXT="${FILE##*.}"
+    EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+
+    case "$EXT_LOWER" in
+        png)
+            /opt/homebrew/bin/optipng $OPTIPNG_FLAGS "$FILE" &gt;/dev/null 2&gt;&amp;1
+            /opt/homebrew/bin/pngquant $PNGQUANT_FLAGS --ext ".png" --force "$FILE" &gt;/dev/null 2&gt;&amp;1
+        ;;
+
+        jpg|jpeg)
+            /opt/homebrew/bin/jpegoptim $JPEGOPTIM_FLAGS "$FILE" &gt;/dev/null 2&gt;&amp;1
+        ;;
+
+        gif)
+            _gif_under_limit "$FILE" &amp;&amp; return
+
+            WORK=$(mktemp -d /tmp/gif-opt-XXXXXX)
+            local work="$WORK/work.gif"
+            cp "$FILE" "$work"
+
+            local pass=0
+            while ! _gif_under_limit "$work" &amp;&amp; [[ $pass -lt $GIF_MAX_PASSES ]]; do
+                pass=$(( pass + 1 ))
+                tmp="$WORK/pass_${pass}.gif"
+                _gif_halve_frames "$work" "$tmp"
+                mv "$tmp" "$work"
+            done
+
+            if _gif_under_limit "$work"; then
+                mv "$work" "$FILE"
+            else
+                local lossy=$GIF_LOSSY_START
+                local lossy_out="$WORK/lossy.gif"
+
+                /opt/homebrew/bin/gifsicle -O3 --lossy="${lossy}" "$work" -o "$lossy_out" &gt;/dev/null 2&gt;&amp;1
+
+                while ! _gif_under_limit "$lossy_out" &amp;&amp; [[ $lossy -lt $GIF_LOSSY_MAX ]]; do
+                    lossy=$(( lossy + GIF_LOSSY_STEP ))
+                    [[ $lossy -gt $GIF_LOSSY_MAX ]] &amp;&amp; lossy=$GIF_LOSSY_MAX
+                    /opt/homebrew/bin/gifsicle -O3 --lossy="${lossy}" "$work" -o "$lossy_out" &gt;/dev/null 2&gt;&amp;1
+                done
+
+                mv "$lossy_out" "$FILE"
+            fi
+
+            rm -rf "$WORK"
+        ;;
+
+        webp)
+            local TMP="${FILE%.*}_optimized.webp"
+            /opt/homebrew/bin/cwebp -q $WEBP_LOSSY_QUALITY "$FILE" -o "$TMP" &gt;/dev/null 2&gt;&amp;1 &amp;&amp; mv "$TMP" "$FILE"
+        ;;
+    esac
+
+    true  # pngquant exits 98 when already optimal; ensure worker always returns 0
+}
+
+export -f optimize_one
+export PNGQUANT_FLAGS OPTIPNG_FLAGS JPEGOPTIM_FLAGS WEBP_LOSSY_QUALITY
+export GIF_MAX_MB GIF_MAX_PASSES GIF_LOSSY_START GIF_LOSSY_MAX GIF_LOSSY_STEP
+export -f _gif_file_bytes _gif_max_bytes _gif_under_limit _gif_frame_count _gif_delay_cs _gif_halve_frames
+
+# ---- Parallel execution ----
+printf '%s\0' "$@" | xargs -0 -n1 -P "$(sysctl -n hw.ncpu)" bash -c 'optimize_one "$@"' _
+
+exit 0  # prevent xargs non-zero exit from triggering Automator's error alert
+</string>
+					<key>CheckedForUserDefaultShell</key>
+					<true/>
+					<key>inputMethod</key>
+					<integer>1</integer>
+					<key>shell</key>
+					<string>/bin/bash</string>
+					<key>source</key>
+					<string></string>
+				</dict>
+				<key>BundleIdentifier</key>
+				<string>com.apple.RunShellScript</string>
+				<key>CFBundleVersion</key>
+				<string>2.0.3</string>
+				<key>CanShowSelectedItemsWhenRun</key>
+				<false/>
+				<key>CanShowWhenRun</key>
+				<true/>
+				<key>Category</key>
+				<array>
+					<string>AMCategoryUtilities</string>
+				</array>
+				<key>Class Name</key>
+				<string>RunShellScriptAction</string>
+				<key>InputUUID</key>
+				<string>DBF8A39D-EA4C-47FC-A217-45C0251D3116</string>
+				<key>Keywords</key>
+				<array>
+					<string>Shell</string>
+					<string>Script</string>
+					<string>Command</string>
+					<string>Run</string>
+					<string>Unix</string>
+				</array>
+				<key>OutputUUID</key>
+				<string>8101EDC7-387A-42BC-81DE-203963B1080F</string>
+				<key>UUID</key>
+				<string>625B1CED-6E8E-4DD6-BCA5-4FDDE07E073D</string>
+				<key>UnlocalizedApplications</key>
+				<array>
+					<string>Automator</string>
+				</array>
+				<key>arguments</key>
+				<dict>
+					<key>0</key>
+					<dict>
+						<key>default value</key>
+						<integer>0</integer>
+						<key>name</key>
+						<string>inputMethod</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>0</string>
+					</dict>
+					<key>1</key>
+					<dict>
+						<key>default value</key>
+						<false/>
+						<key>name</key>
+						<string>CheckedForUserDefaultShell</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>1</string>
+					</dict>
+					<key>2</key>
+					<dict>
+						<key>default value</key>
+						<string></string>
+						<key>name</key>
+						<string>source</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>2</string>
+					</dict>
+					<key>3</key>
+					<dict>
+						<key>default value</key>
+						<string></string>
+						<key>name</key>
+						<string>COMMAND_STRING</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>3</string>
+					</dict>
+					<key>4</key>
+					<dict>
+						<key>default value</key>
+						<string>/bin/sh</string>
+						<key>name</key>
+						<string>shell</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>4</string>
+					</dict>
+				</dict>
+				<key>isViewVisible</key>
+				<integer>1</integer>
+				<key>location</key>
+				<string>404.000000:770.000000</string>
+				<key>nibPath</key>
+				<string>/System/Library/Automator/Run Shell Script.action/Contents/Resources/Base.lproj/main.nib</string>
+			</dict>
+			<key>isViewVisible</key>
+			<integer>1</integer>
+		</dict>
+	</array>
+	<key>connectors</key>
+	<dict>
+		<key>97AFF736-84AA-47FC-8E1E-14ABCB7E1051</key>
+		<dict>
+			<key>from</key>
+			<string>F87B883D-EF9C-466C-838A-392692129DD7 - F87B883D-EF9C-466C-838A-392692129DD7</string>
+			<key>to</key>
+			<string>625B1CED-6E8E-4DD6-BCA5-4FDDE07E073D - 625B1CED-6E8E-4DD6-BCA5-4FDDE07E073D</string>
+		</dict>
+	</dict>
+	<key>workflowMetaData</key>
+	<dict>
+		<key>applicationBundleID</key>
+		<string>com.apple.finder</string>
+		<key>applicationBundleIDsByPath</key>
+		<dict>
+			<key>/System/Library/CoreServices/Finder.app</key>
+			<string>com.apple.finder</string>
+		</dict>
+		<key>applicationPath</key>
+		<string>/System/Library/CoreServices/Finder.app</string>
+		<key>applicationPaths</key>
+		<array>
+			<string>/System/Library/CoreServices/Finder.app</string>
+		</array>
+		<key>inputTypeIdentifier</key>
+		<string>com.apple.Automator.fileSystemObject.image</string>
+		<key>outputTypeIdentifier</key>
+		<string>com.apple.Automator.nothing</string>
+		<key>presentationMode</key>
+		<integer>15</integer>
+		<key>processesInput</key>
+		<false/>
+		<key>serviceApplicationBundleID</key>
+		<string>com.apple.finder</string>
+		<key>serviceApplicationPath</key>
+		<string>/System/Library/CoreServices/Finder.app</string>
+		<key>serviceInputTypeIdentifier</key>
+		<string>com.apple.Automator.fileSystemObject.image</string>
+		<key>serviceOutputTypeIdentifier</key>
+		<string>com.apple.Automator.nothing</string>
+		<key>serviceProcessesInput</key>
+		<false/>
+		<key>systemImageName</key>
+		<string>NSActionTemplate</string>
+		<key>useAutomaticInputType</key>
+		<false/>
+		<key>workflowTypeIdentifier</key>
+		<string>com.apple.Automator.servicesMenu</string>
+	</dict>
+</dict>
+</plist>
