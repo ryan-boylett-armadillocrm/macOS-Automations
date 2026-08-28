@@ -134,17 +134,80 @@ def extract_frame(path, index, width, destination):
     """
     Pulls a single frame out of the movie as a PNG
 
+    Passing no width keeps the frame at its native size. That matters for
+    anything headed to Photoshop, because mov-to-gif.sh resizes inside
+    Photoshop with bicubic, and pre-scaling here with a different resampler
+    shifts the colours of fine detail enough to misrepresent the result
+
     @param path - Movie to read
     @param index - Frame number to extract
-    @param width - Width to scale the frame to
+    @param width - Width to scale to, or None to keep native size
     @param destination - Path the PNG is written to
     """
 
+    scale = f',scale={ width }:-1' if width else ''
+
     subprocess.run(
         [ require_binary('ffmpeg'), '-v', 'error', '-i', str(path),
-          '-vf', f'select=eq(n\\,{ index }),scale={ width }:-1', '-frames:v', '1', '-y', str(destination) ],
+          '-vf', f'select=eq(n\\,{ index }){ scale }', '-frames:v', '1', '-y', str(destination) ],
         capture_output = True, check = True
     )
+
+    return destination
+
+
+def photoshop_script(body):
+    """
+    Runs an ExtendScript snippet in Photoshop and returns its stderr
+
+    @param body - ExtendScript source to execute
+    """
+
+    name = photoshop_name()
+
+    with tempfile.NamedTemporaryFile('w', suffix = '.jsx', delete = False) as handle:
+        handle.write(body)
+        script = handle.name
+
+    result = subprocess.run(
+        [ 'osascript', '-e', f'tell application "{ name }" to do javascript file "{ script }"' ],
+        capture_output = True, text = True
+    )
+
+    Path(script).unlink(missing_ok = True)
+
+    return result.stderr.strip()
+
+
+def photoshop_resize(source, destination, width):
+    """
+    Resizes a frame through Photoshop so the reference view matches the encode
+
+    Both views have to come off the same resampler, otherwise the comparison
+    shows ImageMagick's interpolation rather than what Photoshop will produce
+
+    @param source - PNG frame at native size
+    @param destination - PNG path to write
+    @param width - Target width in pixels
+    """
+
+    error = photoshop_script(f"""(function () {{
+  app.displayDialogs = DialogModes.NO;
+
+  var doc = app.open(new File("{ source }"));
+  var targetWidth = { width };
+  var targetHeight = Math.round(targetWidth * (doc.height.as("px") / doc.width.as("px")));
+
+  doc.resizeImage(UnitValue(targetWidth, "px"), UnitValue(targetHeight, "px"), doc.resolution, ResampleMethod.BICUBIC);
+
+  var options = new PNGSaveOptions();
+
+  doc.saveAs(new File("{ destination }"), options, true, Extension.LOWERCASE);
+  doc.close(SaveOptions.DONOTSAVECHANGES);
+}})();""")
+
+    if not Path(destination).exists():
+        raise RuntimeError(error or 'Photoshop could not resize the frame')
 
     return destination
 
@@ -171,6 +234,14 @@ def photoshop_encode(source, destination, settings):
   app.displayDialogs = DialogModes.NO;
 
   var doc = app.open(new File("{ source }"));
+
+  // Resize here rather than upstream so the preview goes through the same
+  // bicubic step mov-to-gif.sh uses on the real render
+  var targetWidth = { settings.get('width', DEFAULT_WIDTH) };
+  var targetHeight = Math.round(targetWidth * (doc.height.as("px") / doc.width.as("px")));
+
+  doc.resizeImage(UnitValue(targetWidth, "px"), UnitValue(targetHeight, "px"), doc.resolution, ResampleMethod.BICUBIC);
+
   var opts = new ExportOptionsSaveForWeb();
 
   opts.format = SaveDocumentType.COMPUSERVEGIF;
@@ -584,27 +655,44 @@ def build_page(name, source, total = 1, current = 0):
         }}
       }}
 
-      controls.forEach(([ id, output, format ]) => {{
-        const input = document.getElementById(id);
-        const label = document.getElementById(output);
+      /**
+       * Pulls the selected frame again and shows it as the reference view
+       */
+      async function restage() {{
+        status.textContent = 'Extracting frame';
 
-        input.addEventListener('input', () => {{ label.textContent = format(input.value); }});
-        input.addEventListener('change', render);
-      }});
-
-      document.getElementById('reduction').addEventListener('change', render);
-
-      frameSlider.addEventListener('input', () => {{ frameValue.textContent = `${{ frameSlider.value }} / ${{ frameSlider.max }}`; }});
-      frameSlider.addEventListener('change', async () => {{
         const response = await fetch('/frame', {{ method: 'POST', body: JSON.stringify(settings()) }});
         const result = await response.json();
+
+        status.textContent = result.ok ? '' : result.message;
 
         if (result.ok) {{
           image.src = `data:image/png;base64,${{ result.image }}`;
           rendered = null;
           show('source');
         }}
+      }}
+
+      controls.forEach(([ id, output, format ]) => {{
+        const input = document.getElementById(id);
+        const label = document.getElementById(output);
+
+        input.addEventListener('input', () => {{ label.textContent = format(input.value); }});
+
+        // Width changes the reference view too, since Photoshop resizes both
+        input.addEventListener('change', async () => {{
+          if (id === 'width') {{
+            await restage();
+          }}
+
+          render();
+        }});
       }});
+
+      document.getElementById('reduction').addEventListener('change', render);
+
+      frameSlider.addEventListener('input', () => {{ frameValue.textContent = `${{ frameSlider.value }} / ${{ frameSlider.max }}`; }});
+      frameSlider.addEventListener('change', restage);
 
       toggleButton.addEventListener('click', () => show(viewing === 'source' ? 'rendered' : 'source'));
 
@@ -668,8 +756,25 @@ def serve(source, work, total):
     """
 
     middle = max(0, total // 2)
-    reference = extract_frame(source, middle, PREVIEW_WIDTH, work / 'frame.png')
-    page = build_page(source.name, base64.b64encode(reference.read_bytes()).decode(), total, middle).encode()
+
+    def stage_frame(index, width = DEFAULT_WIDTH):
+        """
+        Extracts one frame at native size and returns a Photoshop-resized copy
+
+        @param index - Frame number to pull from the movie
+        @param width - Width the reference view is resized to
+        """
+
+        extract_frame(source, index, None, work / 'frame.png')
+
+        display = work / 'display.png'
+
+        display.unlink(missing_ok = True)
+        photoshop_resize(work / 'frame.png', display, width)
+
+        return display.read_bytes()
+
+    page = build_page(source.name, base64.b64encode(stage_frame(middle)).decode(), total, middle).encode()
 
     finished = threading.Event()
     outcome = {}
@@ -744,8 +849,12 @@ def serve(source, work, total):
 
             if self.path == '/frame':
                 try:
-                    frame = extract_frame(source, payload.get('frame', middle), PREVIEW_WIDTH, work / 'frame.png')
-                    body = { 'ok': True, 'image': base64.b64encode(frame.read_bytes()).decode() }
+                    body = {
+                        'ok': True,
+                        'image': base64.b64encode(
+                            stage_frame(payload.get('frame', middle), payload.get('width', DEFAULT_WIDTH))
+                        ).decode()
+                    }
 
                 except (RuntimeError, subprocess.CalledProcessError) as error:
                     body = { 'ok': False, 'message': str(error) }
