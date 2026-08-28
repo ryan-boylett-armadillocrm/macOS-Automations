@@ -143,31 +143,37 @@ done
 # 5. Verify binaries at expected paths
 info "Verifying binary paths used in workflows…"
 
-declare -A BINS=(
-  [ffmpeg]="/opt/homebrew/bin/ffmpeg"
-  [magick]="/opt/homebrew/bin/magick"
-  [gifsicle]="/opt/homebrew/bin/gifsicle"
-  [potrace]="/opt/homebrew/bin/potrace"
-  [optipng]="/opt/homebrew/bin/optipng"
-  [pngquant]="/opt/homebrew/bin/pngquant"
-  [jpegoptim]="/opt/homebrew/bin/jpegoptim"
-  [cwebp]="/opt/homebrew/bin/cwebp"
+# A plain list, not an associative array - macOS ships bash 3.2, which has none
+BINS=(
+  ffmpeg
+  magick
+  gifsicle
+  potrace
+  optipng
+  pngquant
+  jpegoptim
+  cwebp
 )
 
 ALL_OK=true
-for name in "${!BINS[@]}"; do
-  path="${BINS[$name]}"
+
+for name in "${BINS[@]}"; do
+  path="/opt/homebrew/bin/$name"
+
   if [[ -x "$path" ]]; then
-    echo "  ✓ $name → $path"
+    echo "  ✓ $name -> $path"
+    continue
+  fi
+
+  # Intel Macs install to /usr/local/bin - check there too
+  alt="/usr/local/bin/$name"
+
+  if [[ -x "$alt" ]]; then
+    warn "$name found at $alt (Intel path) - workflows hardcode /opt/homebrew; consider symlinking"
+
   else
-    # Intel Macs install to /usr/local/bin - check there too
-    alt="/usr/local/bin/$name"
-    if [[ -x "$alt" ]]; then
-      warn "$name found at $alt (Intel path) — workflows hardcode /opt/homebrew; consider symlinking."
-    else
-      missing "$name not found at $path"
-      ALL_OK=false
-    fi
+    missing "$name not found at $path"
+    ALL_OK=false
   fi
 done
 
