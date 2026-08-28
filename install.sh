@@ -77,35 +77,7 @@ if [[ ${#WORKFLOWS[@]} -gt 0 ]]; then
   echo "  ✓ Services menu refreshed"
 fi
 
-# 3. Install helper scripts
-# Finder denies services read access to ~/Library/CloudStorage, so anything a
-# workflow shells out to has to sit on local disk
-BIN_DIR="$HOME/bin"
-HELPERS=("$SCRIPT_DIR"/bin/*)
-
-if [[ ${#HELPERS[@]} -eq 0 ]]; then
-  warn "No helper scripts found in bin/ - skipping helper install"
-
-else
-  info "Installing helper scripts to ~/bin…"
-  mkdir -p "$BIN_DIR"
-
-  for helper in "${HELPERS[@]}"; do
-    name="$(basename "$helper")"
-    dest="$BIN_DIR/$name"
-
-    if [[ -e "$dest" && "$helper" -ef "$dest" ]]; then
-      echo "  skipping ${name} - source and destination are the same"
-      continue
-    fi
-
-    echo "  installing ${name}…"
-    cp "$helper" "$dest"
-    chmod +x "$dest"
-  done
-fi
-
-# 4. CLI tools
+# 3. CLI tools
 # Required by the workflows:
 #   ffmpeg        -> Compress Movie, Convert to MP4, Extract First Frame
 #   imagemagick   -> Convert to JPEG/PNG/SVG, Resize Images, Trim Images
@@ -140,7 +112,7 @@ for formula in "${FORMULAE[@]}"; do
   fi
 done
 
-# 5. Verify binaries at expected paths
+# 4. Verify binaries at expected paths
 info "Verifying binary paths used in workflows…"
 
 # A plain list, not an associative array - macOS ships bash 3.2, which has none
@@ -177,7 +149,7 @@ for name in "${BINS[@]}"; do
   fi
 done
 
-# 6. Adobe Photoshop check (Convert to GIF workflow)
+# 5. Adobe Photoshop check (Convert to GIF workflow)
 echo ""
 
 # Adobe nests the bundle inside a versioned folder, so the app is one level
@@ -193,7 +165,7 @@ else
   warn "Install via Creative Cloud: https://creativecloud.adobe.com"
 fi
 
-# 7. Done
+# 6. Done
 echo ""
 if $ALL_OK; then
   info "All done. Your Mac is ready for the Finder Services automations."
