@@ -1,0 +1,15 @@
+{
+  "name": "macos-automations",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Finder Quick Actions for converting, resizing and optimising images and movies",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ryan-boylett-armadillocrm/macOS-Automations.git"
+  },
+  "os": [ "darwin" ],
+  "scripts": {
+    "install": "./install.sh"
+  }
+}
