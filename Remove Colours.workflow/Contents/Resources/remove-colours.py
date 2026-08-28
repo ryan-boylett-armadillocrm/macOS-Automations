@@ -346,7 +346,7 @@ def convert_movie(path):
     if not converter:
         locations = ' or '.join(str(candidate) for candidate in CONVERTER_CANDIDATES)
 
-        raise RuntimeError(f'mov-to-gif.sh is not readable at { locations }. Copy it to ~/bin to convert movies from Finder')
+        raise RuntimeError(f'mov-to-gif.sh is not readable at { locations }. Copy it next to this script to convert movies from Finder')
 
     subprocess.run([ 'bash', str(converter), str(path) ], check = True)
     produced = path.with_suffix('.gif')
