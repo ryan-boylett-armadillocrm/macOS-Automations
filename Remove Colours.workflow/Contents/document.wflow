@@ -63,18 +63,18 @@
 # Remove Colours - launches the picker detached so the Quick Action returns
 # straight away; Finder kills services that outlive their timeout.
 #
-# The script must live outside ~/Library/CloudStorage: macOS denies
-# Finder-invoked services read access to OneDrive's FileProvider domain.
+# The script ships inside this bundle rather than a synced folder: macOS
+# denies Finder-invoked services read access to ~/Library/CloudStorage.
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-SCRIPT="$HOME/bin/remove-colours.py"
+SCRIPT="$HOME/Library/Services/Remove Colours.workflow/Contents/Resources/remove-colours.py"
 LOG="$HOME/Library/Logs/remove-colours.log"
 
 mkdir -p "$(dirname "$LOG")"
 
 if ! head -c 1 "$SCRIPT" &gt;/dev/null 2&gt;&amp;1; then
-  osascript -e 'display alert "Remove Colours" message "Cannot read ~/bin/remove-colours.py."'
+  osascript -e 'display alert "Remove Colours" message "Cannot read remove-colours.py inside the workflow bundle."'
   exit 1
 fi
 
