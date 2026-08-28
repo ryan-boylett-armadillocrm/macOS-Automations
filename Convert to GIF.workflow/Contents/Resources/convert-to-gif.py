@@ -343,12 +343,18 @@ def build_page(name, info, frames, stride):
       }}
 
       .gif__stage {{
+        position: relative;
+
         display: flex;
         align-items: center;
         justify-content: center;
         flex: 1;
         min-height: 0;
+        overflow: hidden;
         padding: 10px;
+
+        cursor: grab;
+        touch-action: none;
 
         border: 1px solid var(--border);
         border-radius: 6px;
@@ -362,9 +368,21 @@ def build_page(name, info, frames, stride):
         background-position: 0 0, 0 8px, 8px -8px, -8px 0px;
       }}
 
+      .gif__stage--panning {{
+        cursor: grabbing;
+      }}
+
       .gif__preview {{
         max-width: 100%;
         max-height: 100%;
+
+        transform-origin: center center;
+        will-change: transform;
+      }}
+
+      /* Crisp pixels once magnified, so single-pixel artefacts stay visible */
+      .gif__preview--magnified {{
+        image-rendering: pixelated;
       }}
 
       .gif__transport {{
@@ -598,6 +616,8 @@ def build_page(name, info, frames, stride):
       <button class="gif__button" id="play" type="button">Play</button>
       <input class="gif__scrub" id="scrub" type="range" min="0" max="{ max(len(frames) - 1, 0) }" value="0" />
       <span class="gif__time" id="time">00:00.00</span>
+      <button class="gif__button" id="fit" type="button">Fit</button>
+      <span class="gif__time" id="zoom">100%</span>
     </div>
 
     <div class="gif__trim" id="trim">
@@ -683,7 +703,6 @@ def build_page(name, info, frames, stride):
 
     <div class="gif__footer">
       <span class="gif__status" id="status">{ info[ 'frames' ] } frames at { info[ 'fps' ] }fps, { info[ 'duration' ] }s</span>
-      <button class="gif__button" id="estimate" type="button">Estimate size</button>
       <button class="gif__button" id="cancel" type="button">Cancel</button>
       <button class="gif__button gif__button--primary" id="convert" type="button">Convert</button>
     </div>
@@ -726,7 +745,14 @@ def build_page(name, info, frames, stride):
       const foreverBox = document.getElementById('forever');
       const status = document.getElementById('status');
       const convertButton = document.getElementById('convert');
-      const estimateButton = document.getElementById('estimate');
+      const stage = document.querySelector('.gif__stage');
+      const zoomLabel = document.getElementById('zoom');
+
+      const view = {{ scale: 1, x: 0, y: 0 }};
+
+      let panning = null;
+      let estimateTimer = null;
+      let estimating = false;
 
       const sliders = [
         [ 'speed', value => `${{ value }}x` ],
@@ -969,7 +995,13 @@ def build_page(name, info, frames, stride):
         applyDrag(dragging, xToFrame(event.clientX - bounds.left));
       }});
 
-      [ 'pointerup', 'pointercancel' ].forEach(name => trim.addEventListener(name, () => {{ dragging = null; }}));
+      [ 'pointerup', 'pointercancel' ].forEach(name => trim.addEventListener(name, () => {{
+        if (dragging === 'start' || dragging === 'end') {{
+          scheduleEstimate();
+        }}
+
+        dragging = null;
+      }}));
 
       [ startInput, endInput ].forEach(input => input.addEventListener('change', () => {{
         const value = Math.max(0, Math.min(sourceFrames - 1, Number(input.value) || 0));
@@ -985,12 +1017,14 @@ def build_page(name, info, frames, stride):
         }}
 
         layout();
+        scheduleEstimate();
       }}));
 
       document.getElementById('trim-reset').addEventListener('click', () => {{
         trimStart = 0;
         trimEnd = sourceFrames - 1;
         layout();
+        scheduleEstimate();
       }});
 
       window.addEventListener('resize', () => {{
@@ -1017,16 +1051,110 @@ def build_page(name, info, frames, stride):
         loopsInput.disabled = foreverBox.checked;
       }});
 
-      estimateButton.addEventListener('click', async () => {{
-        estimateButton.disabled = true;
-        status.textContent = 'Encoding a sample';
+      /**
+       * Applies the current pan and zoom to the preview
+       */
+      function applyView() {{
+        preview.style.transform = `translate(${{ view.x }}px, ${{ view.y }}px) scale(${{ view.scale }})`;
+        preview.classList.toggle('gif__preview--magnified', view.scale > 1.5);
+        zoomLabel.textContent = `${{ Math.round(view.scale * 100) }}%`;
+      }}
 
-        const response = await fetch('/estimate', {{ method: 'POST', body: JSON.stringify(settings()) }});
-        const result = await response.json();
+      stage.addEventListener('wheel', event => {{
+        event.preventDefault();
 
-        status.textContent = result.message;
-        estimateButton.disabled = false;
+        const bounds = stage.getBoundingClientRect();
+        const next = Math.max(0.2, Math.min(24, view.scale * Math.exp(-event.deltaY * 0.0018)));
+        const ratio = next / view.scale;
+
+        // Keep whatever sits under the cursor pinned while the scale changes
+        const x = event.clientX - bounds.left - bounds.width / 2;
+        const y = event.clientY - bounds.top - bounds.height / 2;
+
+        view.x = x - (x - view.x) * ratio;
+        view.y = y - (y - view.y) * ratio;
+        view.scale = next;
+
+        applyView();
+      }}, {{ passive: false }});
+
+      stage.addEventListener('pointerdown', event => {{
+        panning = {{ x: event.clientX, y: event.clientY }};
+        stage.classList.add('gif__stage--panning');
+        stage.setPointerCapture(event.pointerId);
       }});
+
+      stage.addEventListener('pointermove', event => {{
+        if (!panning) {{
+          return;
+        }}
+
+        view.x += event.clientX - panning.x;
+        view.y += event.clientY - panning.y;
+        panning = {{ x: event.clientX, y: event.clientY }};
+
+        applyView();
+      }});
+
+      [ 'pointerup', 'pointercancel' ].forEach(name => stage.addEventListener(name, () => {{
+        panning = null;
+        stage.classList.remove('gif__stage--panning');
+      }}));
+
+      stage.addEventListener('dblclick', () => {{
+        view.scale = 1;
+        view.x = 0;
+        view.y = 0;
+        applyView();
+      }});
+
+      document.getElementById('fit').addEventListener('click', () => {{
+        view.scale = 1;
+        view.x = 0;
+        view.y = 0;
+        applyView();
+      }});
+
+      /**
+       * Re-estimates the output size a beat after the settings settle
+       *
+       * Each estimate encodes a real sample, so it waits for typing and
+       * slider drags to finish rather than firing on every keystroke
+       */
+      function scheduleEstimate() {{
+        clearTimeout(estimateTimer);
+        status.textContent = 'Settings changed';
+        estimateTimer = setTimeout(runEstimate, 1_000);
+      }}
+
+      /**
+       * Encodes a sample and reports the projected file size
+       */
+      async function runEstimate() {{
+        if (estimating) {{
+          scheduleEstimate();
+
+          return;
+        }}
+
+        estimating = true;
+        status.textContent = 'Estimating size';
+
+        try {{
+          const response = await fetch('/estimate', {{ method: 'POST', body: JSON.stringify(settings()) }});
+          const result = await response.json();
+
+          status.textContent = result.message;
+        }}
+
+        catch (error) {{
+          status.textContent = 'Could not estimate size';
+        }}
+
+        finally {{
+          estimating = false;
+        }}
+      }}
 
       convertButton.addEventListener('click', async () => {{
         convertButton.disabled = true;
@@ -1061,6 +1189,16 @@ def build_page(name, info, frames, stride):
         }}
       }});
 
+      // Every setting feeds the same debounced estimate, so the projected
+      // size stays in step with the controls without a button
+      [ 'speed', 'fps', 'quality', 'preset', 'width', 'height', 'loops', 'forever', 'bounce', 'fast', 'fixed' ]
+        .forEach(id => {{
+          const input = document.getElementById(id);
+
+          input.addEventListener('input', scheduleEstimate);
+          input.addEventListener('change', scheduleEstimate);
+        }});
+
       // Thumbnails decode in the background; the strip repaints as they land
       frames.forEach(data => {{
         const image = new Image();
@@ -1073,6 +1211,8 @@ def build_page(name, info, frames, stride):
       draw();
       drawStrip();
       layout();
+      applyView();
+      runEstimate();
     </script>
   </body>
 </html>"""
