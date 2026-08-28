@@ -519,6 +519,66 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
         width: 62px;
       }}
 
+      .gif__toggle {{
+        position: relative;
+
+        flex: 0 0 auto;
+        width: 34px;
+        height: 20px;
+        margin: 0;
+
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: #3a3a3a;
+        appearance: none;
+        cursor: pointer;
+
+        transition: background 0.15s ease;
+      }}
+
+      .gif__toggle::after {{
+        position: absolute;
+        top: 2px;
+        left: 2px;
+
+        width: 14px;
+        height: 14px;
+
+        border-radius: 50%;
+        background: #e8e8e8;
+
+        transition: transform 0.15s ease;
+
+        content: '';
+      }}
+
+      .gif__toggle:checked {{
+        border-color: transparent;
+        background: var(--accent);
+      }}
+
+      .gif__toggle:checked::after {{
+        transform: translateX(14px);
+      }}
+
+      .gif__zoom {{
+        position: relative;
+
+        display: inline-flex;
+      }}
+
+      /* The select sits invisibly over its button so a click opens the
+         native menu, without depending on showPicker being available */
+      .gif__zoom-menu {{
+        position: absolute;
+        inset: 0;
+
+        width: 100%;
+        opacity: 0;
+
+        cursor: pointer;
+      }}
+
       .gif__colour {{
         width: 40px;
         height: 24px;
@@ -665,8 +725,19 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
       <button class="gif__button" id="play" type="button">Play</button>
       <input class="gif__scrub" id="scrub" type="range" min="0" max="{ max(len(frames) - 1, 0) }" value="0" />
       <span class="gif__time" id="time">00:00.00</span>
-      <button class="gif__button" id="fit" type="button">Fit</button>
-      <span class="gif__time" id="zoom">100%</span>
+      <span class="gif__zoom">
+        <button class="gif__button" id="zoom" type="button">Fit</button>
+        <select class="gif__zoom-menu" id="zoom-menu" aria-label="Zoom level">
+          <option value="fit">Fit to Window</option>
+          <option value="25">25%</option>
+          <option value="50">50%</option>
+          <option value="100">100%</option>
+          <option value="200">200%</option>
+          <option value="400">400%</option>
+          <option value="800">800%</option>
+          <option value="1600">1600%</option>
+        </select>
+      </span>
     </div>
 
     <div class="gif__trim" id="trim">
@@ -719,7 +790,7 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
 
         <div class="gif__field">
           <span class="gif__key">Pin colour</span>
-          <input id="pin" type="checkbox" />
+          <input class="gif__toggle" id="pin" type="checkbox" />
           <input class="gif__colour" id="fixed" type="color" value="{ pinned }" disabled />
           <span class="gif__time" id="pin-value">{ pinned }</span>
         </div>
@@ -798,6 +869,7 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
       const convertButton = document.getElementById('convert');
       const stage = document.querySelector('.gif__stage');
       const zoomLabel = document.getElementById('zoom');
+      const zoomMenu = document.getElementById('zoom-menu');
       const pinBox = document.getElementById('pin');
       const fixedInput = document.getElementById('fixed');
       const pinValue = document.getElementById('pin-value');
@@ -1114,12 +1186,43 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
       }});
 
       /**
+       * Reports zoom against the image's real pixels, not its fitted size
+       *
+       * The preview is letterboxed to the stage by CSS, so a scale of 1 is
+       * whatever fits rather than one screen pixel per image pixel
+       */
+      function zoomPercent() {{
+        const fitted = preview.clientWidth;
+
+        return fitted && preview.naturalWidth
+          ? Math.round(fitted * view.scale / preview.naturalWidth * 100)
+          : Math.round(view.scale * 100);
+      }}
+
+      /**
        * Applies the current pan and zoom to the preview
        */
       function applyView() {{
         preview.style.transform = `translate(${{ view.x }}px, ${{ view.y }}px) scale(${{ view.scale }})`;
-        preview.classList.toggle('gif__preview--magnified', view.scale > 1.5);
-        zoomLabel.textContent = `${{ Math.round(view.scale * 100) }}%`;
+        preview.classList.toggle('gif__preview--magnified', zoomPercent() > 120);
+        zoomLabel.textContent = `${{ zoomPercent() }}%`;
+      }}
+
+      /**
+       * Jumps to a preset zoom, recentring as it goes
+       *
+       * @param value - Either fit, or a percentage of actual pixels
+       */
+      function setZoom(value) {{
+        const fitted = preview.clientWidth || 1;
+
+        view.x = 0;
+        view.y = 0;
+        view.scale = value === 'fit' || !preview.naturalWidth
+          ? 1
+          : Number(value) / 100 * preview.naturalWidth / fitted;
+
+        applyView();
       }}
 
       stage.addEventListener('wheel', event => {{
@@ -1163,18 +1266,18 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
         stage.classList.remove('gif__stage--panning');
       }}));
 
-      stage.addEventListener('dblclick', () => {{
-        view.scale = 1;
-        view.x = 0;
-        view.y = 0;
-        applyView();
+      stage.addEventListener('dblclick', () => setZoom('fit'));
+
+      zoomMenu.addEventListener('change', () => {{
+        setZoom(zoomMenu.value);
+        zoomMenu.selectedIndex = -1;
       }});
 
-      document.getElementById('fit').addEventListener('click', () => {{
-        view.scale = 1;
-        view.x = 0;
-        view.y = 0;
-        applyView();
+      // Keyboard activation of the button still needs to open the menu
+      zoomLabel.addEventListener('click', () => {{
+        if (typeof zoomMenu.showPicker === 'function') {{
+          zoomMenu.showPicker();
+        }}
       }});
 
       /**
