@@ -29,31 +29,49 @@ else
 fi
 
 # 2. Install workflow bundles
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SERVICES_DIR="$HOME/Library/Services"
 
-info "Installing workflow bundles to ~/Library/Services…"
 mkdir -p "$SERVICES_DIR"
+SERVICES_DIR="$(cd "$SERVICES_DIR" && pwd -P)"
 
 shopt -s nullglob
 WORKFLOWS=("$SCRIPT_DIR"/*.workflow)
 
 if [[ ${#WORKFLOWS[@]} -eq 0 ]]; then
-  warn "No .workflow files found next to install.sh — skipping workflow install."
+  warn "No .workflow files found next to install.sh - skipping workflow install"
+
+elif [[ "$SCRIPT_DIR" == "$SERVICES_DIR" ]]; then
+  # Cloning the repo straight into ~/Library/Services means the bundles are
+  # already installed - copying one onto itself would destroy it
+  info "Running from ~/Library/Services - bundles are already in place"
+
 else
+  info "Installing workflow bundles to ~/Library/Services…"
+
   for wf in "${WORKFLOWS[@]}"; do
     name="$(basename "$wf")"
     dest="$SERVICES_DIR/$name"
+
+    if [[ -e "$dest" && "$wf" -ef "$dest" ]]; then
+      echo "  skipping ${name} - source and destination are the same"
+      continue
+    fi
+
     if [[ -d "$dest" ]]; then
       echo "  updating ${name}…"
       rm -rf "$dest"
+
     else
       echo "  installing ${name}…"
     fi
+
     cp -R "$wf" "$dest"
   done
+fi
 
-  # Register the new services with macOS without requiring a logout/login
+if [[ ${#WORKFLOWS[@]} -gt 0 ]]; then
+  # Register the services with macOS without requiring a logout/login
   # pbs (pasteboard server) manages the Services menu - -update rescans ~/Library/Services
   /System/Library/CoreServices/pbs -update
   echo "  ✓ Services menu refreshed"
@@ -74,10 +92,16 @@ else
 
   for helper in "${HELPERS[@]}"; do
     name="$(basename "$helper")"
+    dest="$BIN_DIR/$name"
+
+    if [[ -e "$dest" && "$helper" -ef "$dest" ]]; then
+      echo "  skipping ${name} - source and destination are the same"
+      continue
+    fi
 
     echo "  installing ${name}…"
-    cp "$helper" "$BIN_DIR/$name"
-    chmod +x "$BIN_DIR/$name"
+    cp "$helper" "$dest"
+    chmod +x "$dest"
   done
 fi
 
