@@ -32,7 +32,9 @@ from argparse import ArgumentParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-PREVIEW_WIDTH = 420
+# Wide enough that fitting to the pane barely upscales, without the page
+# carrying the ~10MB of base64 a full-width proxy would cost
+PREVIEW_WIDTH = 640
 PREVIEW_FRAME_CAP = 240
 ESTIMATE_FRAMES = 12
 DEFAULT_FPS = 30
@@ -406,16 +408,15 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
         transform-origin: center center;
         will-change: transform;
 
+        /* Never interpolate: smoothing would hide the single-pixel artefacts
+           this preview exists to judge */
+        image-rendering: pixelated;
+
         /* The stage owns every pointer gesture; without this the browser
            starts its own image drag and the pan never happens */
         pointer-events: none;
         user-select: none;
         -webkit-user-drag: none;
-      }}
-
-      /* Crisp pixels once magnified, so single-pixel artefacts stay visible */
-      .gif__preview--magnified {{
-        image-rendering: pixelated;
       }}
 
       .gif__transport {{
@@ -1171,7 +1172,12 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
 
       [ widthInput, heightInput ].forEach(input => input.addEventListener('input', () => {{
         preset.value = 'custom';
+
+        // The zoom reading is relative to the output width, so it moves too
+        applyView();
       }}));
+
+      preset.addEventListener('change', applyView);
 
       foreverBox.addEventListener('change', () => {{
         loopsInput.disabled = foreverBox.checked;
@@ -1186,17 +1192,23 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
       }});
 
       /**
-       * Reports zoom against the image's real pixels, not its fitted size
+       * Width the finished GIF will actually be
+       */
+      function outputWidth() {{
+        return Number(widthInput.value) || sourceWidth;
+      }}
+
+      /**
+       * Reports zoom against the output GIF's pixels
        *
-       * The preview is letterboxed to the stage by CSS, so a scale of 1 is
-       * whatever fits rather than one screen pixel per image pixel
+       * The on-screen preview is a proxy at a fixed width, so its own scale
+       * says nothing useful. Measuring against the chosen output width means
+       * 100% shows the asset at the size it will ship at
        */
       function zoomPercent() {{
-        const fitted = preview.clientWidth;
+        const shown = preview.clientWidth * view.scale;
 
-        return fitted && preview.naturalWidth
-          ? Math.round(fitted * view.scale / preview.naturalWidth * 100)
-          : Math.round(view.scale * 100);
+        return Math.round(shown / ( outputWidth() || 1 ) * 100);
       }}
 
       /**
@@ -1204,8 +1216,25 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
        */
       function applyView() {{
         preview.style.transform = `translate(${{ view.x }}px, ${{ view.y }}px) scale(${{ view.scale }})`;
-        preview.classList.toggle('gif__preview--magnified', zoomPercent() > 120);
         zoomLabel.textContent = `${{ zoomPercent() }}%`;
+      }}
+
+      /**
+       * Scale that brings the image just inside the stage on both axes
+       *
+       * CSS already caps the image at the pane, but a proxy smaller than the
+       * pane would otherwise sit at natural size surrounded by empty space
+       */
+      function fitScale() {{
+        const available = 0.97;
+        const spare = 20;
+        const width = preview.clientWidth || 1;
+        const height = preview.clientHeight || 1;
+
+        return Math.min(
+          ( stage.clientWidth - spare ) / width,
+          ( stage.clientHeight - spare ) / height
+        ) * available;
       }}
 
       /**
@@ -1214,13 +1243,11 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
        * @param value - Either fit, or a percentage of actual pixels
        */
       function setZoom(value) {{
-        const fitted = preview.clientWidth || 1;
-
         view.x = 0;
         view.y = 0;
-        view.scale = value === 'fit' || !preview.naturalWidth
-          ? 1
-          : Number(value) / 100 * preview.naturalWidth / fitted;
+        view.scale = value === 'fit'
+          ? fitScale()
+          : Number(value) / 100 * outputWidth() / ( preview.clientWidth || 1 );
 
         applyView();
       }}
@@ -1372,6 +1399,10 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
         image.src = `data:image/png;base64,${{ data }}`;
         thumbs.push(image);
       }});
+
+      // Fitting needs the image's laid-out size, which only exists once the
+      // first frame has decoded
+      preview.addEventListener('load', () => setZoom('fit'), {{ once: true }});
 
       draw();
       drawStrip();
