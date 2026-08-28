@@ -468,8 +468,17 @@ def build_page(name, palette, preview, total = 1, current = 0):
 
       .picker__scrub {{
         flex: 1;
+        min-width: 0;
 
         accent-color: var(--accent);
+      }}
+
+      .picker__frame {{
+        flex: 0 0 auto;
+
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        color: var(--muted);
       }}
 
       .picker__sidebar {{
@@ -658,7 +667,8 @@ def build_page(name, palette, preview, total = 1, current = 0):
           <button class="picker__button picker__button--icon" id="play" type="button" disabled>Play</button>
           <button class="picker__button picker__button--icon" id="rewind" type="button" disabled>Rewind</button>
           <button class="picker__button picker__button--icon" id="loop" type="button">Loop</button>
-          <input class="picker__scrub" id="scrub" type="range" min="0" max="0" value="0" disabled />
+          <input class="picker__scrub" id="frame" type="range" min="0" max="{ max(total - 1, 0) }" value="{ current }" />
+          <span class="picker__frame" id="frame-value">{ current } / { max(total - 1, 0) }</span>
           <button class="picker__button picker__button--icon" id="animate" type="button">Build animation</button>
         </div>
       </div>
@@ -681,13 +691,6 @@ def build_page(name, palette, preview, total = 1, current = 0):
         </div>
 
         <div class="picker__swatches" id="swatches"></div>
-
-        <div class="picker__label">
-          <span>Preview frame</span>
-          <span id="frame-value">{ current } / { max(total - 1, 0) }</span>
-        </div>
-
-        <input class="picker__slider" id="frame" type="range" min="0" max="{ max(total - 1, 0) }" value="{ current }" />
 
         <div class="picker__label">
           <span>Grouping threshold</span>
@@ -761,6 +764,12 @@ def build_page(name, palette, preview, total = 1, current = 0):
       const targetInput = document.getElementById('target');
       const frameSlider = document.getElementById('frame');
       const frameValue = document.getElementById('frame-value');
+      const sourceFrames = { max(total, 1) };
+
+      // One slider serves as both the still-frame picker and the animation
+      // playhead, switching role when an animation is built
+      let timeline = 'still';
+      let stillFrame = { current };
       const animateButton = document.getElementById('animate');
       const playButton = document.getElementById('play');
       const rewindButton = document.getElementById('rewind');
@@ -932,8 +941,22 @@ def build_page(name, palette, preview, total = 1, current = 0):
           disposal: disposalSelect.value,
           mode: modeSelect.value,
           target: targetInput.value,
-          frame: Number(frameSlider.value)
+          frame: stillFrame
         }};
+      }}
+
+      /**
+       * Points the slider at either the source frames or the animation
+       *
+       * @param mode - Either still or animation
+       * @param highest - Largest index the slider can reach
+       * @param value - Index to move the slider to
+       */
+      function setTimeline(mode, highest, value) {{
+        timeline = mode;
+        frameSlider.max = String(highest);
+        frameSlider.value = String(value);
+        frameValue.textContent = `${{ value }} / ${{ highest }}`;
       }}
 
       /**
@@ -943,6 +966,10 @@ def build_page(name, palette, preview, total = 1, current = 0):
         stop();
         canvas.hidden = true;
         preview.hidden = false;
+
+        if (timeline === 'animation') {{
+          setTimeline('still', sourceFrames - 1, stillFrame);
+        }}
 
         // Fetched even with nothing selected, so the frame slider still moves
         const response = await fetch('/preview', {{ method: 'POST', body: JSON.stringify(settings()) }});
@@ -960,7 +987,8 @@ def build_page(name, palette, preview, total = 1, current = 0):
         if (frame) {{
           context.clearRect(0, 0, canvas.width, canvas.height);
           context.drawImage(frame, 0, 0);
-          scrub.value = String(player.index);
+          frameSlider.value = String(player.index);
+          frameValue.textContent = `${{ player.index }} / ${{ frameSlider.max }}`;
         }}
       }}
 
@@ -1062,8 +1090,7 @@ def build_page(name, palette, preview, total = 1, current = 0):
 
         player.index = 0;
         player.elapsed = 0;
-        scrub.max = String(player.frames.length - 1);
-        scrub.disabled = false;
+        setTimeline('animation', player.frames.length - 1, 0);
         playButton.disabled = false;
         rewindButton.disabled = false;
 
@@ -1086,11 +1113,6 @@ def build_page(name, palette, preview, total = 1, current = 0):
         loopButton.classList.toggle('picker__button--on', player.looping);
       }});
 
-      scrub.addEventListener('input', () => {{
-        stop();
-        player.index = Number(scrub.value);
-        draw();
-      }});
 
       directionButton.addEventListener('click', () => {{
         descending = !descending;
@@ -1152,9 +1174,20 @@ def build_page(name, palette, preview, total = 1, current = 0):
 
       frameSlider.addEventListener('input', () => {{
         frameValue.textContent = `${{ frameSlider.value }} / ${{ frameSlider.max }}`;
+
+        if (timeline === 'animation') {{
+          stop();
+          player.index = Number(frameSlider.value);
+          draw();
+        }}
       }});
 
-      frameSlider.addEventListener('change', renderPreview);
+      frameSlider.addEventListener('change', () => {{
+        if (timeline === 'still') {{
+          stillFrame = Number(frameSlider.value);
+          renderPreview();
+        }}
+      }});
 
       // Snapping almost always targets the background, which is the colour
       // covering the most pixels

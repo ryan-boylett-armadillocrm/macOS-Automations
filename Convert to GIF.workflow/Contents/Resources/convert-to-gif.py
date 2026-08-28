@@ -497,6 +497,21 @@ def build_page(name, source, total = 1, current = 0):
         accent-color: var(--accent);
       }}
 
+      .settings__scrub {{
+        flex: 1;
+        min-width: 0;
+
+        accent-color: var(--accent);
+      }}
+
+      .settings__frame {{
+        flex: 0 0 auto;
+
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        color: var(--muted);
+      }}
+
       .settings__button {{
         flex: 1;
         padding: 7px 12px;
@@ -563,8 +578,8 @@ def build_page(name, source, total = 1, current = 0):
         <div class="settings__transport">
           <button class="settings__button settings__button--icon" id="toggle" type="button">Source</button>
           <button class="settings__button settings__button--icon" id="zoom" type="button">100%</button>
-          <span class="settings__status" id="showing">showing source</span>
-          <button class="settings__button settings__button--icon" id="render" type="button">Preview</button>
+          <input class="settings__scrub" id="frame" type="range" min="0" max="{ max(total - 1, 0) }" value="{ current }" />
+          <span class="settings__frame" id="frame-value">{ current } / { max(total - 1, 0) }</span>
         </div>
       </div>
 
@@ -601,13 +616,6 @@ def build_page(name, source, total = 1, current = 0):
 
         <input class="settings__slider" id="width" type="range" min="120" max="1200" step="10" value="{ DEFAULT_WIDTH }" />
 
-        <div class="settings__label">
-          <span>Frame</span>
-          <span id="frame-value">{ current } / { max(total - 1, 0) }</span>
-        </div>
-
-        <input class="settings__slider" id="frame" type="range" min="0" max="{ max(total - 1, 0) }" value="{ current }" />
-
         <div class="settings__spacer"></div>
 
         <div class="settings__row">
@@ -625,8 +633,6 @@ def build_page(name, source, total = 1, current = 0):
       const image = document.getElementById('image');
       const toggleButton = document.getElementById('toggle');
       const zoomButton = document.getElementById('zoom');
-      const showing = document.getElementById('showing');
-      const renderButton = document.getElementById('render');
       const convertButton = document.getElementById('convert');
       const status = document.getElementById('status');
       const frameSlider = document.getElementById('frame');
@@ -666,7 +672,6 @@ def build_page(name, source, total = 1, current = 0):
       function show(which) {{
         viewing = which;
         image.src = which === 'rendered' && rendered ? rendered : sourceImage;
-        showing.textContent = which === 'rendered' ? 'showing encoded' : 'showing source';
         toggleButton.textContent = which === 'rendered' ? 'Encoded' : 'Source';
         toggleButton.classList.toggle('settings__button--on', which === 'rendered');
       }}
@@ -684,7 +689,6 @@ def build_page(name, source, total = 1, current = 0):
         }}
 
         busy = true;
-        renderButton.disabled = true;
         status.textContent = 'Encoding in Photoshop';
 
         const ticket = ++sequence;
@@ -704,13 +708,12 @@ def build_page(name, source, total = 1, current = 0):
           }}
 
           rendered = `data:image/png;base64,${{ result.image }}`;
-          status.textContent = `${{ result.colours }} colours`;
+          status.textContent = result.colours;
           show('rendered');
         }}
 
         finally {{
           busy = false;
-          renderButton.disabled = false;
 
           if (queued) {{
             queued = false;
@@ -761,7 +764,11 @@ def build_page(name, source, total = 1, current = 0):
       document.getElementById('reduction').addEventListener('change', render);
 
       frameSlider.addEventListener('input', () => {{ frameValue.textContent = `${{ frameSlider.value }} / ${{ frameSlider.max }}`; }});
-      frameSlider.addEventListener('change', restage);
+
+      frameSlider.addEventListener('change', async () => {{
+        await restage();
+        render();
+      }});
 
       toggleButton.addEventListener('click', () => show(viewing === 'source' ? 'rendered' : 'source'));
 
@@ -770,8 +777,6 @@ def build_page(name, source, total = 1, current = 0):
         zoomButton.textContent = `${{ zoom * 100 }}%`;
         image.style.width = zoom === 1 ? 'auto' : `${{ image.naturalWidth * zoom }}px`;
       }});
-
-      renderButton.addEventListener('click', render);
 
       document.getElementById('reset').addEventListener('click', () => {{
         document.getElementById('colours').value = {DEFAULT_COLOURS};
@@ -810,6 +815,8 @@ def build_page(name, source, total = 1, current = 0):
           navigator.sendBeacon('/cancel');
         }}
       }});
+
+      render();
     </script>
   </body>
 </html>"""
@@ -970,7 +977,7 @@ def serve(source, work, total):
                     body = {
                         'ok': True,
                         'image': base64.b64encode(data).decode(),
-                        'colours': f'{ palette or "?" } across { len(indices) } sampled frames'
+                        'colours': f'{ palette or "?" } colours across { len(indices) } sampled frames'
                     }
 
                 except (RuntimeError, subprocess.CalledProcessError) as error:
