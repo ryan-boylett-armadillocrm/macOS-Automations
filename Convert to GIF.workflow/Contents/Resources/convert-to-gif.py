@@ -227,11 +227,11 @@ def gifski_command(source, destination, settings):
         '--repeat', str(settings.get('repeat', 0)),
     ]
 
+    # Only the width is sent. gifski stretches to fit when given both, so
+    # passing a rounded height would distort by a pixel or two; letting it
+    # derive the height keeps the source aspect exactly
     if settings.get('width'):
         command += [ '--width', str(settings[ 'width' ]) ]
-
-    if settings.get('height'):
-        command += [ '--height', str(settings[ 'height' ]) ]
 
     if settings.get('bounce'):
         command.append('--bounce')
@@ -837,6 +837,7 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
       const sourceFrames = { info[ 'frames' ] };
       const sourceWidth = { info[ 'width' ] };
       const sourceHeight = { info[ 'height' ] };
+      const aspect = sourceWidth ? sourceHeight / sourceWidth : 1;
 
       const preview = document.getElementById('preview');
       const scrub = document.getElementById('scrub');
@@ -1170,12 +1171,21 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
         heightInput.value = String(Math.round(sourceHeight * factor));
       }});
 
-      [ widthInput, heightInput ].forEach(input => input.addEventListener('input', () => {{
+      // Dimensions stay locked to the source aspect. gifski stretches when
+      // both are given, so an unlinked pair silently distorts the output
+      widthInput.addEventListener('input', () => {{
         preset.value = 'custom';
+        heightInput.value = String(Math.max(1, Math.round(Number(widthInput.value) * aspect)));
 
         // The zoom reading is relative to the output width, so it moves too
         applyView();
-      }}));
+      }});
+
+      heightInput.addEventListener('input', () => {{
+        preset.value = 'custom';
+        widthInput.value = String(Math.max(1, Math.round(Number(heightInput.value) / aspect)));
+        applyView();
+      }});
 
       preset.addEventListener('change', applyView);
 
