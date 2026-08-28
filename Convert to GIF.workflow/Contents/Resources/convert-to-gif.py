@@ -152,6 +152,32 @@ def preview_frames(path, info, work):
     return [ base64.b64encode(frame.read_bytes()).decode() for frame in frames ], stride
 
 
+def dominant_colour(path):
+    """
+    Returns the most common colour in a frame, as a hex string
+
+    Used to seed the pin swatch, since the colour worth protecting from
+    quantisation is almost always the flat background
+
+    @param path - Image to sample
+    """
+
+    result = subprocess.run(
+        [ require_binary('magick'), str(path), '-depth', '8', '-format', '%c', 'histogram:info:-' ],
+        capture_output = True, text = True
+    )
+
+    best = ( 0, '#000000' )
+
+    for line in result.stdout.splitlines():
+        match = re.search(r'^\s*(\d+):.*(#[0-9A-Fa-f]{6})', line)
+
+        if match and int(match.group(1)) > best[ 0 ]:
+            best = ( int(match.group(1)), match.group(2).lower() )
+
+    return best[ 1 ]
+
+
 def trim_clip(source, destination, start, end, info):
     """
     Cuts the movie to the chosen range without re-encoding
@@ -283,7 +309,7 @@ def estimate_size(source, settings, info, work):
     return round(target.stat().st_size / encoded * total * scale)
 
 
-def build_page(name, info, frames, stride):
+def build_page(name, info, frames, stride, pinned = '#000000'):
     """
     Renders the converter UI as a single self-contained page
 
@@ -291,6 +317,7 @@ def build_page(name, info, frames, stride):
     @param info - Result of movie_info
     @param frames - Base64 preview frames covering the timeline
     @param stride - Source frames represented by each preview frame
+    @param pinned - Colour the pin swatch starts on
     """
 
     return f"""<!doctype html>
@@ -492,6 +519,22 @@ def build_page(name, info, frames, stride):
         width: 62px;
       }}
 
+      .gif__colour {{
+        width: 40px;
+        height: 24px;
+        padding: 2px;
+
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        background: #1c1c1c;
+        cursor: pointer;
+      }}
+
+      .gif__colour:disabled {{
+        opacity: 0.4;
+        cursor: default;
+      }}
+
       .gif__panels {{
         display: grid;
         grid-template-columns: 1fr 1fr;
@@ -676,7 +719,9 @@ def build_page(name, info, frames, stride):
 
         <div class="gif__field">
           <span class="gif__key">Pin colour</span>
-          <input class="gif__input" id="fixed" type="text" placeholder="#040633" />
+          <input id="pin" type="checkbox" />
+          <input class="gif__colour" id="fixed" type="color" value="{ pinned }" disabled />
+          <span class="gif__time" id="pin-value">{ pinned }</span>
         </div>
       </div>
 
@@ -753,6 +798,9 @@ def build_page(name, info, frames, stride):
       const convertButton = document.getElementById('convert');
       const stage = document.querySelector('.gif__stage');
       const zoomLabel = document.getElementById('zoom');
+      const pinBox = document.getElementById('pin');
+      const fixedInput = document.getElementById('fixed');
+      const pinValue = document.getElementById('pin-value');
 
       const view = {{ scale: 1, x: 0, y: 0 }};
 
@@ -825,7 +873,7 @@ def build_page(name, info, frames, stride):
           repeat: foreverBox.checked ? 0 : Math.max(Number(loopsInput.value) || 1, 1),
           bounce: document.getElementById('bounce').checked,
           fast: document.getElementById('fast').checked,
-          fixed: document.getElementById('fixed').value.trim()
+          fixed: pinBox.checked ? fixedInput.value : ''
         }};
       }}
 
@@ -1057,6 +1105,14 @@ def build_page(name, info, frames, stride):
         loopsInput.disabled = foreverBox.checked;
       }});
 
+      pinBox.addEventListener('change', () => {{
+        fixedInput.disabled = !pinBox.checked;
+      }});
+
+      fixedInput.addEventListener('input', () => {{
+        pinValue.textContent = fixedInput.value;
+      }});
+
       /**
        * Applies the current pan and zoom to the preview
        */
@@ -1197,7 +1253,7 @@ def build_page(name, info, frames, stride):
 
       // Every setting feeds the same debounced estimate, so the projected
       // size stays in step with the controls without a button
-      [ 'speed', 'fps', 'quality', 'preset', 'width', 'height', 'loops', 'forever', 'bounce', 'fast', 'fixed' ]
+      [ 'speed', 'fps', 'quality', 'preset', 'width', 'height', 'loops', 'forever', 'bounce', 'fast', 'pin', 'fixed' ]
         .forEach(id => {{
           const input = document.getElementById(id);
 
@@ -1234,7 +1290,9 @@ def serve(source, info, work):
     """
 
     frames, stride = preview_frames(source, info, work)
-    page = build_page(source.name, info, frames, stride).encode()
+    staged = sorted(work.glob('p_*.png'))
+    pinned = dominant_colour(staged[ len(staged) // 2 ]) if staged else '#000000'
+    page = build_page(source.name, info, frames, stride, pinned).encode()
 
     finished = threading.Event()
     outcome = {}
