@@ -520,6 +520,16 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
         width: 62px;
       }}
 
+      .gif__input--hex {{
+        width: 84px;
+
+        font-variant-numeric: tabular-nums;
+      }}
+
+      .gif__input:disabled {{
+        opacity: 0.4;
+      }}
+
       .gif__toggle {{
         position: relative;
 
@@ -793,7 +803,7 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
           <span class="gif__key">Pin colour</span>
           <input class="gif__toggle" id="pin" type="checkbox" />
           <input class="gif__colour" id="fixed" type="color" value="{ pinned }" disabled />
-          <span class="gif__time" id="pin-value">{ pinned }</span>
+          <input class="gif__input gif__input--hex" id="pin-value" type="text" value="{ pinned }" maxlength="7" spellcheck="false" autocomplete="off" disabled />
         </div>
       </div>
 
@@ -1193,12 +1203,44 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
         loopsInput.disabled = foreverBox.checked;
       }});
 
+      /**
+       * Normalises pasted hex into #rrggbb, or null when it is not a colour
+       *
+       * Accepts the shorthand and a missing hash, since those are what get
+       * pasted out of design tools and stylesheets
+       *
+       * @param value - Raw text from the hex field
+       */
+      function normaliseHex(value) {{
+        const raw = value.trim().replace(/^#/, '');
+        const expanded = raw.length === 3 ? raw.split('').map(part => part + part).join('') : raw;
+
+        return /^[0-9a-f]{{6}}$/i.test(expanded) ? `#${{ expanded.toLowerCase() }}` : null;
+      }}
+
       pinBox.addEventListener('change', () => {{
         fixedInput.disabled = !pinBox.checked;
+        pinValue.disabled = !pinBox.checked;
       }});
 
       fixedInput.addEventListener('input', () => {{
-        pinValue.textContent = fixedInput.value;
+        pinValue.value = fixedInput.value;
+      }});
+
+      pinValue.addEventListener('input', () => {{
+        const hex = normaliseHex(pinValue.value);
+
+        // Only push valid colours across, so half-typed values are not fought
+        if (hex) {{
+          fixedInput.value = hex;
+        }}
+      }});
+
+      pinValue.addEventListener('change', () => {{
+        const hex = normaliseHex(pinValue.value);
+
+        pinValue.value = hex || fixedInput.value;
+        fixedInput.value = pinValue.value;
       }});
 
       /**
@@ -1393,7 +1435,7 @@ def build_page(name, info, frames, stride, pinned = '#000000'):
 
       // Every setting feeds the same debounced estimate, so the projected
       // size stays in step with the controls without a button
-      [ 'speed', 'fps', 'quality', 'preset', 'width', 'height', 'loops', 'forever', 'bounce', 'fast', 'pin', 'fixed' ]
+      [ 'speed', 'fps', 'quality', 'preset', 'width', 'height', 'loops', 'forever', 'bounce', 'fast', 'pin', 'fixed', 'pin-value' ]
         .forEach(id => {{
           const input = document.getElementById(id);
 
