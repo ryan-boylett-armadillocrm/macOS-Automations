@@ -378,6 +378,12 @@ def build_page(name, info, frames, stride):
 
         transform-origin: center center;
         will-change: transform;
+
+        /* The stage owns every pointer gesture; without this the browser
+           starts its own image drag and the pan never happens */
+        pointer-events: none;
+        user-select: none;
+        -webkit-user-drag: none;
       }}
 
       /* Crisp pixels once magnified, so single-pixel artefacts stay visible */
@@ -609,7 +615,7 @@ def build_page(name, info, frames, stride):
     </div>
 
     <div class="gif__stage">
-      <img class="gif__preview" id="preview" alt="Preview" />
+      <img class="gif__preview" id="preview" alt="Preview" draggable="false" />
     </div>
 
     <div class="gif__transport">
