@@ -45,10 +45,10 @@ else
     name="$(basename "$wf")"
     dest="$SERVICES_DIR/$name"
     if [[ -d "$dest" ]]; then
-      echo "  updating $name…"
+      echo "  updating ${name}…"
       rm -rf "$dest"
     else
-      echo "  installing $name…"
+      echo "  installing ${name}…"
     fi
     cp -R "$wf" "$dest"
   done
@@ -59,7 +59,29 @@ else
   echo "  ✓ Services menu refreshed"
 fi
 
-# 3. CLI tools
+# 3. Install helper scripts
+# Finder denies services read access to ~/Library/CloudStorage, so anything a
+# workflow shells out to has to sit on local disk
+BIN_DIR="$HOME/bin"
+HELPERS=("$SCRIPT_DIR"/bin/*)
+
+if [[ ${#HELPERS[@]} -eq 0 ]]; then
+  warn "No helper scripts found in bin/ - skipping helper install"
+
+else
+  info "Installing helper scripts to ~/bin…"
+  mkdir -p "$BIN_DIR"
+
+  for helper in "${HELPERS[@]}"; do
+    name="$(basename "$helper")"
+
+    echo "  installing ${name}…"
+    cp "$helper" "$BIN_DIR/$name"
+    chmod +x "$BIN_DIR/$name"
+  done
+fi
+
+# 4. CLI tools
 # Required by the workflows:
 #   ffmpeg        -> Compress Movie, Convert to MP4, Extract First Frame
 #   imagemagick   -> Convert to JPEG/PNG/SVG, Resize Images, Trim Images
@@ -69,6 +91,9 @@ fi
 #   pngquant      -> Optimize Images (PNG quantisation)
 #   jpegoptim     -> Optimize Images (JPEG strip & compress)
 #   webp          -> Optimize Images (cwebp lossy WebP)
+#
+# Remove Colours additionally needs python3 (Xcode command line tools) and, for
+# the colour picker window, Google Chrome - it falls back to the default browser
 
 FORMULAE=(
   ffmpeg
@@ -86,12 +111,12 @@ for formula in "${FORMULAE[@]}"; do
   if brew list --formula "$formula" &>/dev/null; then
     echo "  ✓ $formula already installed"
   else
-    echo "  installing $formula…"
+    echo "  installing ${formula}…"
     brew install "$formula"
   fi
 done
 
-# 4. Verify binaries at expected paths
+# 5. Verify binaries at expected paths
 info "Verifying binary paths used in workflows…"
 
 declare -A BINS=(
@@ -122,7 +147,7 @@ for name in "${!BINS[@]}"; do
   fi
 done
 
-# 5. Adobe Photoshop check (Convert to GIF workflow)
+# 6. Adobe Photoshop check (Convert to GIF workflow)
 echo ""
 if ls -d /Applications/Adobe\ Photoshop\ *.app &>/dev/null 2>&1; then
   PS_APP=$(ls -d /Applications/Adobe\ Photoshop\ *.app 2>/dev/null | sort -r | head -1)
@@ -132,7 +157,7 @@ else
   warn "Install via Creative Cloud: https://creativecloud.adobe.com"
 fi
 
-# 6. Done
+# 7. Done
 echo ""
 if $ALL_OK; then
   info "All done. Your Mac is ready for the Finder Services automations."
