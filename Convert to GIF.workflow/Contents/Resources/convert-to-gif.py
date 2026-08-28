@@ -32,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PREVIEW_WIDTH = 650
+PREVIEW_SAMPLE_FRAMES = 24
 DEFAULT_COLOURS = 256
 DEFAULT_DITHER = 100
 DEFAULT_REDUCTION = 'adaptive'
@@ -208,6 +209,52 @@ def photoshop_resize(source, destination, width):
 
     if not Path(destination).exists():
         raise RuntimeError(error or 'Photoshop could not resize the frame')
+
+    return destination
+
+
+def preview_indices(total, selected):
+    """
+    Picks frames spread across the movie, always including the chosen one
+
+    Save for Web builds one adaptive palette for the whole animation, so a
+    preview encoded from a single frame allocates its 256 slots completely
+    differently to the finished GIF. Sampling proportionally across the
+    length gives the quantiser a representative spread to work from
+
+    @param total - Frame count of the movie
+    @param selected - Frame the user is inspecting
+    """
+
+    step = max(1, total // PREVIEW_SAMPLE_FRAMES)
+    indices = set(range(0, total, step))
+
+    indices.add(min(selected, max(total - 1, 0)))
+    ordered = sorted(indices)
+
+    return ordered, ordered.index(min(selected, max(total - 1, 0)))
+
+
+def build_proxy(source, indices, destination):
+    """
+    Builds a short ProRes clip holding just the sampled frames
+
+    Kept as ProRes so the proxy feeds mov-to-gif.sh exactly as the original
+    movie would, which is what makes the preview palette representative
+
+    @param source - Movie to sample
+    @param indices - Frame numbers to keep
+    @param destination - Movie path to write
+    """
+
+    expression = '+'.join(f'eq(n\\,{ index })' for index in indices)
+
+    subprocess.run(
+        [ require_binary('ffmpeg'), '-v', 'error', '-i', str(source),
+          '-vf', f"select='{ expression }',setpts=N/FRAME_RATE/TB",
+          '-frames:v', str(len(indices)), '-c:v', 'prores_ks', '-y', str(destination) ],
+        capture_output = True, check = True
+    )
 
     return destination
 
@@ -595,6 +642,8 @@ def build_page(name, source, total = 1, current = 0):
       let viewing = 'source';
       let zoom = 1;
       let busy = false;
+      let queued = false;
+      let sequence = 0;
 
       /**
        * Returns the current settings as sent to the server
@@ -626,7 +675,11 @@ def build_page(name, source, total = 1, current = 0):
        * Asks Photoshop to encode the current frame at the current settings
        */
       async function render() {{
+        // Requests coalesce rather than drop: a change made while Photoshop
+        // is busy re-runs afterwards, so the final settings always win
         if (busy) {{
+          queued = true;
+
           return;
         }}
 
@@ -634,9 +687,15 @@ def build_page(name, source, total = 1, current = 0):
         renderButton.disabled = true;
         status.textContent = 'Encoding in Photoshop';
 
+        const ticket = ++sequence;
+
         try {{
           const response = await fetch('/preview', {{ method: 'POST', body: JSON.stringify(settings()) }});
           const result = await response.json();
+
+          if (ticket !== sequence) {{
+            return;
+          }}
 
           if (!result.ok) {{
             status.textContent = result.message;
@@ -644,14 +703,19 @@ def build_page(name, source, total = 1, current = 0):
             return;
           }}
 
-          rendered = `data:image/gif;base64,${{ result.image }}`;
-          status.textContent = `${{ result.colours }} colours in this frame`;
+          rendered = `data:image/png;base64,${{ result.image }}`;
+          status.textContent = `${{ result.colours }} colours`;
           show('rendered');
         }}
 
         finally {{
           busy = false;
           renderButton.disabled = false;
+
+          if (queued) {{
+            queued = false;
+            render();
+          }}
         }}
       }}
 
@@ -661,8 +725,13 @@ def build_page(name, source, total = 1, current = 0):
       async function restage() {{
         status.textContent = 'Extracting frame';
 
+        const ticket = ++sequence;
         const response = await fetch('/frame', {{ method: 'POST', body: JSON.stringify(settings()) }});
         const result = await response.json();
+
+        if (ticket !== sequence) {{
+          return;
+        }}
 
         status.textContent = result.ok ? '' : result.message;
 
@@ -757,6 +826,11 @@ def serve(source, work, total):
 
     middle = max(0, total // 2)
 
+    # Requests are served on parallel threads, but Photoshop is a single
+    # instance and the staged frames are shared files, so every step that
+    # touches either has to run one at a time
+    photoshop = threading.Lock()
+
     def stage_frame(index, width = DEFAULT_WIDTH):
         """
         Extracts one frame at native size and returns a Photoshop-resized copy
@@ -849,12 +923,10 @@ def serve(source, work, total):
 
             if self.path == '/frame':
                 try:
-                    body = {
-                        'ok': True,
-                        'image': base64.b64encode(
-                            stage_frame(payload.get('frame', middle), payload.get('width', DEFAULT_WIDTH))
-                        ).decode()
-                    }
+                    with photoshop:
+                        image = stage_frame(payload.get('frame', middle), payload.get('width', DEFAULT_WIDTH))
+
+                    body = { 'ok': True, 'image': base64.b64encode(image).decode() }
 
                 except (RuntimeError, subprocess.CalledProcessError) as error:
                     body = { 'ok': False, 'message': str(error) }
@@ -865,19 +937,40 @@ def serve(source, work, total):
 
             if self.path == '/preview':
                 try:
-                    encoded = work / 'preview.gif'
-                    encoded.unlink(missing_ok = True)
+                    selected = payload.get('frame', middle)
+                    indices, position = preview_indices(total, selected)
 
-                    photoshop_encode(work / 'frame.png', encoded, payload)
-                    colours = subprocess.run(
-                        [ require_binary('magick'), str(encoded), '-format', '%k', 'info:' ],
-                        capture_output = True, text = True
-                    ).stdout.strip()
+                    with photoshop:
+                        proxy = work / 'proxy.mov'
+                        produced = work / 'proxy.gif'
+
+                        proxy.unlink(missing_ok = True)
+                        produced.unlink(missing_ok = True)
+
+                        build_proxy(source, indices, proxy)
+                        convert_movie(proxy, payload)
+
+                        subprocess.run(
+                            [ require_binary('magick'), str(produced), '-coalesce',
+                              '-scene', '0', str(work / 'still_%04d.png') ],
+                            capture_output = True, check = True
+                        )
+
+                        frames = sorted(work.glob('still_*.png'))
+                        chosen = frames[ min(position, len(frames) - 1) ]
+                        data = chosen.read_bytes()
+                        palette = subprocess.run(
+                            [ require_binary('magick'), str(produced), '-coalesce', '-append', '-format', '%k', 'info:' ],
+                            capture_output = True, text = True
+                        ).stdout.strip()
+
+                        for stale in frames:
+                            stale.unlink(missing_ok = True)
 
                     body = {
                         'ok': True,
-                        'image': base64.b64encode(encoded.read_bytes()).decode(),
-                        'colours': colours or '?'
+                        'image': base64.b64encode(data).decode(),
+                        'colours': f'{ palette or "?" } across { len(indices) } sampled frames'
                     }
 
                 except (RuntimeError, subprocess.CalledProcessError) as error:
